@@ -180,6 +180,29 @@ void refspec_item_clear(struct refspec_item *item)
 	item->exact_sha1 = 0;
 }
 
+char *refspec_item_format(const struct refspec_item *rsi)
+{
+	struct strbuf buf = STRBUF_INIT;
+
+	if (rsi->matching)
+		return xstrdup(":");
+
+	if (rsi->negative)
+		strbuf_addch(&buf, '^');
+	else if (rsi->force)
+		strbuf_addch(&buf, '+');
+
+	if (rsi->src)
+		strbuf_addstr(&buf, rsi->src);
+
+	if (rsi->dst) {
+		strbuf_addch(&buf, ':');
+		strbuf_addstr(&buf, rsi->dst);
+	}
+
+	return strbuf_detach(&buf, NULL);
+}
+
 void refspec_init(struct refspec *rs, int fetch)
 {
 	memset(rs, 0, sizeof(*rs));
