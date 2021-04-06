@@ -32,6 +32,7 @@
 #include "remote.h"
 #include "object-store.h"
 #include "exec-cmd.h"
+#include "refspec.h"
 
 #define FAILED_RUN "failed to run %s"
 
@@ -877,6 +878,7 @@ static int fetch_remote(struct remote *remote, void *cbdata)
 {
 	struct maintenance_run_opts *opts = cbdata;
 	struct child_process child = CHILD_PROCESS_INIT;
+	int i;
 
 	child.git_cmd = 1;
 	strvec_pushl(&child.args, "fetch", remote->name, "--prune", "--no-tags",
@@ -886,7 +888,40 @@ static int fetch_remote(struct remote *remote, void *cbdata)
 	if (opts->quiet)
 		strvec_push(&child.args, "--quiet");
 
-	strvec_pushf(&child.args, "+refs/heads/*:refs/prefetch/%s/*", remote->name);
+	for (i = 0; i < remote->fetch.nr; i++) {
+		struct refspec_item replace;
+		struct refspec_item *rsi = &remote->fetch.items[i];
+		struct strbuf new_dst = STRBUF_INIT;
+		size_t ignore_len = 0;
+		char *replace_string;
+
+		if (rsi->negative) {
+			strvec_push(&child.args, remote->fetch.raw[i]);
+			continue;
+		}
+
+		refspec_item_init(&replace, remote->fetch.raw[i], 1);
+
+		/*
+		 * If a refspec dst starts with "refs/" at the start,
+		 * then we will replace "refs/" with "refs/prefetch/".
+		 * Otherwise, we will prepend the dst string with
+		 * "refs/prefetch/".
+		 */
+		if (!strncmp(replace.dst, "refs/", 5))
+			ignore_len = 5;
+
+		strbuf_addstr(&new_dst, "refs/prefetch/");
+		strbuf_addstr(&new_dst, replace.dst + ignore_len);
+		free(replace.dst);
+		replace.dst = strbuf_detach(&new_dst, NULL);
+
+		replace_string = refspec_item_format(&replace);
+		strvec_push(&child.args, replace_string);
+		free(replace_string);
+
+		refspec_item_clear(&replace);
+	}
 
 	return !!run_command(&child);
 }
