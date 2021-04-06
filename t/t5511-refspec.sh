@@ -93,4 +93,45 @@ test_refspec fetch "refs/heads/${good}"
 bad=$(printf '\011tab')
 test_refspec fetch "refs/heads/${bad}"				invalid
 
+test_expect_success 'test input/output round trip' '
+	cat >input <<-\EOF &&
+	+refs/heads/*:refs/remotes/origin/*
+	refs/heads/*:refs/remotes/origin/*
+	refs/heads/main:refs/remotes/frotz/xyzzy
+	:refs/remotes/frotz/deleteme
+	^refs/heads/secrets
+	refs/heads/secret:refs/heads/translated
+	refs/heads/secret:heads/translated
+	refs/heads/secret:remotes/translated
+	secret:translated
+	refs/heads/*:remotes/xxy/*
+	refs/heads*/for-linus:refs/remotes/mine/*
+	2e36527f23b7f6ae15e6f21ac3b08bf3fed6ee48:refs/heads/fixed
+	HEAD
+	@
+	:
+	EOF
+	cat >expect <<-\EOF &&
+	+refs/heads/*:refs/remotes/origin/*
+	refs/heads/*:refs/remotes/origin/*
+	refs/heads/main:refs/remotes/frotz/xyzzy
+	:refs/remotes/frotz/deleteme
+	^refs/heads/secrets
+	refs/heads/secret:refs/heads/translated
+	refs/heads/secret:heads/translated
+	refs/heads/secret:remotes/translated
+	secret:translated
+	refs/heads/*:remotes/xxy/*
+	refs/heads*/for-linus:refs/remotes/mine/*
+	2e36527f23b7f6ae15e6f21ac3b08bf3fed6ee48:refs/heads/fixed
+	HEAD
+	HEAD
+	:
+	EOF
+	test-tool refspec <input >output &&
+	test_cmp expect output &&
+	test-tool refspec --fetch <input >output &&
+	test_cmp expect output
+'
+
 test_done
