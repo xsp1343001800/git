@@ -253,6 +253,8 @@ int merge_all_index(struct index_state *istate, int oneshot, int quiet,
 	int err = 0, ret;
 	unsigned int i, prev_nr;
 
+	/* TODO: audit for interaction with sparse-index. */
+	ensure_full_index(istate);
 	for (i = 0; i < istate->cache_nr; i++) {
 		const struct cache_entry *ce = istate->cache[i];
 		if (!ce_stage(ce))
