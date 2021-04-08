@@ -236,21 +236,34 @@ trailer.<token>.command::
 	be called to automatically add or modify a trailer with the
 	specified <token>.
 +
-When this option is specified, the behavior is as if a special
-'<token>=<value>' argument were added at the beginning of the command
-line, where <value> is taken to be the standard output of the
-specified command with any leading and trailing whitespace trimmed
-off.
+When this option is specified, the first occurrence of substring $ARG is
+replaced with the value given to the `interpret-trailer` command for the
+same token.
 +
-If the command contains the `$ARG` string, this string will be
-replaced with the <value> part of an existing trailer with the same
-<token>, if any, before the command is launched.
+".command" has been deprecated due to the $ARG in the user's command can
+only be replaced once and the original way of replacing $ARG was not safe.
+Now the preferred option is using "trailer.<token>.cmd", which use position
+argument to pass the value.
++
+When both .cmd and .command are given for the same <token>,
+.cmd is used and .command is ignored.
+
+trailer.<token>.cmd::
+	The command specified by this configuration variable is run
+	with a single parameter, which is the <value> part of an
+	existing trailer with the same <token>.  The output from the
+	command is then used as the value for the <token> in the
+	resulting trailer.
++
+When this option is specified, If there is no trailer with same <token>,
+the behavior is as if a special '<token>=<value>' argument were added at
+the beginning of the command, <value> will be passed to the user's
+command as an empty value.
 +
 If some '<token>=<value>' arguments are also passed on the command
 line, when a 'trailer.<token>.command' is configured, the command will
 also be executed for each of these arguments. And the <value> part of
-these arguments, if any, will be used to replace the `$ARG` string in
-the command.
+these arguments, if any, will be passed to the command as first parameter.
 
 EXAMPLES
 --------
@@ -331,6 +344,55 @@ $ echo "subject" | git interpret-trailers --trailer fix=42
 subject
 
 Fix #42
+------------
+
+* Configure a 'see' trailer with a cmd use a global script `git-one`
+  to show the subject of a commit that is related, and show how it works:
++
+------------
+$ cat ~/bin/git-one
+#!/bin/sh
+git show -s --pretty=reference "$1"
+$ git config trailer.see.key "See-also: "
+$ git config trailer.see.ifExists "replace"
+$ git config trailer.see.ifMissing "doNothing"
+$ git config trailer.see.cmd "~/bin/git-one"
+$ git interpret-trailers <<EOF
+> subject
+>
+> message
+>
+> see: HEAD~2
+> EOF
+subject
+
+message
+
+See-also: fe3187e (subject of related commit, 2021-4-2)
+------------
+
+* Configure a 'who' trailer with a cmd use a global script `git-who`
+  to find the recent matching "author <mail>" pair in git log and
+  show how it works:
++
+------------
+$ cat ~/bin/git-who
+ #!/bin/sh
+    git log -1 --format="%an <%ae>" --author="$1"
+$ git config trailer.help.key "Helped-by: "
+$ git config trailer.help.ifExists "replace"
+$ git config trailer.help.cmd "~/bin/git-who"
+$ git interpret-trailers --trailer="help:gitster@" <<EOF
+> subject
+>
+> message
+>
+> EOF
+subject
+
+message
+
+Helped-by: Junio C Hamano <gitster@pobox.com>
 ------------
 
 * Configure a 'see' trailer with a command to show the subject of a
