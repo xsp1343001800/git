@@ -180,6 +180,16 @@ void child_process_clear(struct child_process *);
 int is_executable(const char *name);
 
 /**
+ * Returns if a $PATH given by parameter is found or not (it is NULL). This
+ * function uses locate_in_PATH() function that emulates the path search that
+ * execvp would perform. Memory used to store the resultant path is freed by
+ * the function.
+ *
+ * The caller should ensure that $PATH contains no directory separators.
+ */
+int exists_in_PATH(const char *file);
+
+/**
  * Start a sub-process. Takes a pointer to a `struct child_process`
  * that specifies the details and returns pipe FDs (if requested).
  * See below for details.
