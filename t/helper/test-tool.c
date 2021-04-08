@@ -56,6 +56,7 @@ static struct test_cmd cmds[] = {
 	{ "read-cache", cmd__read_cache },
 	{ "read-graph", cmd__read_graph },
 	{ "read-midx", cmd__read_midx },
+	{ "refspec", cmd__refspec },
 	{ "ref-store", cmd__ref_store },
 	{ "regex", cmd__regex },
 	{ "repository", cmd__repository },

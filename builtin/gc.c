@@ -32,6 +32,7 @@
 #include "remote.h"
 #include "object-store.h"
 #include "exec-cmd.h"
+#include "refspec.h"
 
 #define FAILED_RUN "failed to run %s"
 
@@ -873,55 +874,72 @@ static int maintenance_task_commit_graph(struct maintenance_run_opts *opts)
 	return 0;
 }
 
-static int fetch_remote(const char *remote, struct maintenance_run_opts *opts)
+static int fetch_remote(struct remote *remote, void *cbdata)
 {
+	struct maintenance_run_opts *opts = cbdata;
 	struct child_process child = CHILD_PROCESS_INIT;
+	int i;
 
 	child.git_cmd = 1;
-	strvec_pushl(&child.args, "fetch", remote, "--prune", "--no-tags",
+	strvec_pushl(&child.args, "fetch", remote->name, "--prune", "--no-tags",
 		     "--no-write-fetch-head", "--recurse-submodules=no",
 		     "--refmap=", NULL);
 
 	if (opts->quiet)
 		strvec_push(&child.args, "--quiet");
 
-	strvec_pushf(&child.args, "+refs/heads/*:refs/prefetch/%s/*", remote);
+	for (i = 0; i < remote->fetch.nr; i++) {
+		struct refspec_item replace;
+		struct refspec_item *rsi = &remote->fetch.items[i];
+		struct strbuf new_dst = STRBUF_INIT;
+		size_t ignore_len = 0;
+		char *replace_string;
+
+		if (rsi->negative) {
+			strvec_push(&child.args, remote->fetch.raw[i]);
+			continue;
+		}
+
+		refspec_item_init(&replace, remote->fetch.raw[i], 1);
+
+		/*
+		 * If a refspec dst starts with "refs/" at the start,
+		 * then we will replace "refs/" with "refs/prefetch/".
+		 * Otherwise, we will prepend the dst string with
+		 * "refs/prefetch/".
+		 */
+		if (!strncmp(replace.dst, "refs/", 5))
+			ignore_len = 5;
+
+		strbuf_addstr(&new_dst, "refs/prefetch/");
+		strbuf_addstr(&new_dst, replace.dst + ignore_len);
+		free(replace.dst);
+		replace.dst = strbuf_detach(&new_dst, NULL);
+
+		replace_string = refspec_item_format(&replace);
+		strvec_push(&child.args, replace_string);
+		free(replace_string);
+
+		refspec_item_clear(&replace);
+	}
 
 	return !!run_command(&child);
 }
 
-static int append_remote(struct remote *remote, void *cbdata)
-{
-	struct string_list *remotes = (struct string_list *)cbdata;
-
-	string_list_append(remotes, remote->name);
-	return 0;
-}
-
 static int maintenance_task_prefetch(struct maintenance_run_opts *opts)
 {
-	int result = 0;
-	struct string_list_item *item;
-	struct string_list remotes = STRING_LIST_INIT_DUP;
-
 	git_config_set_multivar_gently("log.excludedecoration",
 					"refs/prefetch/",
 					"refs/prefetch/",
 					CONFIG_FLAGS_FIXED_VALUE |
 					CONFIG_FLAGS_MULTI_REPLACE);
 
-	if (for_each_remote(append_remote, &remotes)) {
-		error(_("failed to fill remotes"));
-		result = 1;
-		goto cleanup;
+	if (for_each_remote(fetch_remote, opts)) {
+		error(_("failed to prefetch remotes"));
+		return 1;
 	}
 
-	for_each_string_list_item(item, &remotes)
-		result |= fetch_remote(item->string, opts);
-
-cleanup:
-	string_list_clear(&remotes, 0);
-	return result;
+	return 0;
 }
 
 static int maintenance_task_gc(struct maintenance_run_opts *opts)

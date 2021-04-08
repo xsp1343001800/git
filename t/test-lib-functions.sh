@@ -1652,9 +1652,9 @@ test_subcommand () {
 
 	if test -n "$negate"
 	then
-		! grep "\[$expr\]"
+		! grep -F "[$expr]"
 	else
-		grep "\[$expr\]"
+		grep -F "[$expr]"
 	fi
 }
 

@@ -142,18 +142,49 @@ test_expect_success 'prefetch multiple remotes' '
 	test_commit -C clone2 two &&
 	GIT_TRACE2_EVENT="$(pwd)/run-prefetch.txt" git maintenance run --task=prefetch 2>/dev/null &&
 	fetchargs="--prune --no-tags --no-write-fetch-head --recurse-submodules=no --refmap= --quiet" &&
-	test_subcommand git fetch remote1 $fetchargs +refs/heads/\\*:refs/prefetch/remote1/\\* <run-prefetch.txt &&
-	test_subcommand git fetch remote2 $fetchargs +refs/heads/\\*:refs/prefetch/remote2/\\* <run-prefetch.txt &&
+	test_subcommand git fetch remote1 $fetchargs "+refs/heads/*:refs/prefetch/remotes/remote1/*" <run-prefetch.txt &&
+	test_subcommand git fetch remote2 $fetchargs "+refs/heads/*:refs/prefetch/remotes/remote2/*" <run-prefetch.txt &&
 	test_path_is_missing .git/refs/remotes &&
-	git log prefetch/remote1/one &&
-	git log prefetch/remote2/two &&
+	git log prefetch/remotes/remote1/one &&
+	git log prefetch/remotes/remote2/two &&
 	git fetch --all &&
-	test_cmp_rev refs/remotes/remote1/one refs/prefetch/remote1/one &&
-	test_cmp_rev refs/remotes/remote2/two refs/prefetch/remote2/two &&
+	test_cmp_rev refs/remotes/remote1/one refs/prefetch/remotes/remote1/one &&
+	test_cmp_rev refs/remotes/remote2/two refs/prefetch/remotes/remote2/two &&
 
 	test_cmp_config refs/prefetch/ log.excludedecoration &&
 	git log --oneline --decorate --all >log &&
 	! grep "prefetch" log
+'
+
+test_expect_success 'prefetch custom refspecs' '
+	git -C clone1 branch -f special/fetched HEAD &&
+	git -C clone1 branch -f special/secret/not-fetched HEAD &&
+
+	# create multiple refspecs for remote1
+	git config --add remote.remote1.fetch "+refs/heads/special/fetched:refs/heads/fetched" &&
+	git config --add remote.remote1.fetch "^refs/heads/special/secret/not-fetched" &&
+
+	GIT_TRACE2_EVENT="$(pwd)/prefetch-refspec.txt" git maintenance run --task=prefetch 2>/dev/null &&
+
+	fetchargs="--prune --no-tags --no-write-fetch-head --recurse-submodules=no --refmap= --quiet" &&
+
+	# skips second refspec because it is not a pattern type
+	rs1="+refs/heads/*:refs/prefetch/remotes/remote1/*" &&
+	rs2="+refs/heads/special/fetched:refs/prefetch/heads/fetched" &&
+	rs3="^refs/heads/special/secret/not-fetched" &&
+
+	test_subcommand git fetch remote1 $fetchargs "$rs1" "$rs2" "$rs3" <prefetch-refspec.txt &&
+	test_subcommand git fetch remote2 $fetchargs "+refs/heads/*:refs/prefetch/remotes/remote2/*" <prefetch-refspec.txt &&
+
+	# first refspec is overridden by second
+	test_must_fail git rev-parse refs/prefetch/special/fetched &&
+	git rev-parse refs/prefetch/heads/fetched &&
+
+	# possible incorrect places for the non-fetched ref
+	test_must_fail git rev-parse refs/prefetch/remotes/remote1/secret/not-fetched &&
+	test_must_fail git rev-parse refs/prefetch/remotes/remote1/not-fetched &&
+	test_must_fail git rev-parse refs/heads/secret/not-fetched &&
+	test_must_fail git rev-parse refs/heads/not-fetched
 '
 
 test_expect_success 'prefetch and existing log.excludeDecoration values' '
