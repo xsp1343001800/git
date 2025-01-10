@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 
+my ($build_dir) = @ARGV;
 my %include = ();
 my %included = ();
 
@@ -10,6 +11,7 @@ for my $text (<*.txt>) {
 	    chomp;
 	    s/^include::\s*//;
 	    s/\[\]//;
+	    s/{build_dir}/${build_dir}/;
 	    $include{$text}{$_} = 1;
 	    $included{$_} = 1;
 	}
@@ -38,9 +40,10 @@ while ($changed) {
     }
 }
 
-while (my ($text, $included) = each %include) {
+foreach my $text (sort keys %include) {
+    my $included = $include{$text};
     if (! exists $included{$text} &&
 	(my $base = $text) =~ s/\.txt$//) {
-	print "$base.html $base.xml : ", join(" ", keys %$included), "\n";
+	print "$base.html $base.xml : ", join(" ", sort keys %$included), "\n";
     }
 }

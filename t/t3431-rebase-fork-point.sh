@@ -50,7 +50,7 @@ test_rebase () {
 
 test_rebase 'G F E D B A'
 test_rebase 'G F D B A' --onto D
-test_rebase 'G F B A' --keep-base
+test_rebase 'G F C B A' --keep-base
 test_rebase 'G F C E D B A' --no-fork-point
 test_rebase 'G F C D B A' --no-fork-point --onto D
 test_rebase 'G F C B A' --no-fork-point --keep-base
@@ -73,7 +73,7 @@ test_rebase 'G F C D B A' --onto D main
 test_rebase 'G F C B A' --keep-base refs/heads/main
 test_rebase 'G F C B A' --keep-base main
 
-test_expect_success 'git rebase --fork-point with ambigous refname' '
+test_expect_success 'git rebase --fork-point with ambiguous refname' '
 	git checkout main &&
 	git checkout -b one &&
 	git checkout side &&
@@ -83,7 +83,7 @@ test_expect_success 'git rebase --fork-point with ambigous refname' '
 
 test_expect_success '--fork-point and --root both given' '
 	test_must_fail git rebase --fork-point --root 2>err &&
-	test_i18ngrep "cannot combine" err
+	test_grep "cannot be used together" err
 '
 
 test_expect_success 'rebase.forkPoint set to false' '

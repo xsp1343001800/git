@@ -168,6 +168,9 @@ Supported commands: 'list', 'import'.
 	Can guarantee that when a clone is requested, the received
 	pack is self contained and is connected.
 
+'get'::
+	Can use the 'get' command to download a file from a given URI.
+
 If a helper advertises 'connect', Git will use it if possible and
 fall back to another capability if the helper requests so when
 connecting (see the 'connect' command under COMMANDS).
@@ -418,6 +421,12 @@ Supported if the helper has the "connect" capability.
 +
 Supported if the helper has the "stateless-connect" capability.
 
+'get' <uri> <path>::
+	Downloads the file from the given `<uri>` to the given `<path>`. If
+	`<path>.temp` exists, then Git assumes that the `.temp` file is a
+	partial download from a previous attempt and will resume the
+	download from that position.
+
 If a fatal error occurs, the program writes the error message to
 stderr and exits. The caller should expect that a suitable error
 message has been printed if the child closes the connection without
@@ -470,14 +479,14 @@ set by Git if the remote helper has the 'option' capability.
 'option depth' <depth>::
 	Deepens the history of a shallow repository.
 
-'option deepen-since <timestamp>::
+'option deepen-since' <timestamp>::
 	Deepens the history of a shallow repository based on time.
 
-'option deepen-not <ref>::
+'option deepen-not' <ref>::
 	Deepens the history of a shallow repository excluding ref.
 	Multiple options add up.
 
-'option deepen-relative {'true'|'false'}::
+'option deepen-relative' {'true'|'false'}::
 	Deepens the history of a shallow repository relative to
 	current boundary. Only valid when used with "option depth".
 
@@ -517,7 +526,7 @@ set by Git if the remote helper has the 'option' capability.
 'option pushcert' {'true'|'false'}::
 	GPG sign pushes.
 
-'option push-option <string>::
+'option push-option' <string>::
 	Transmit <string> as a push option. As the push option
 	must not contain LF or NUL characters, the string is not encoded.
 
@@ -533,13 +542,10 @@ set by Git if the remote helper has the 'option' capability.
 	transaction.  If successful, all refs will be updated, or none will.  If the
 	remote side does not support this capability, the push will fail.
 
-'option object-format' {'true'|algorithm}::
-	If 'true', indicate that the caller wants hash algorithm information
+'option object-format true'::
+	Indicate that the caller wants hash algorithm information
 	to be passed back from the remote.  This mode is used when fetching
 	refs.
-+
-If set to an algorithm, indicate that the caller wants to interact with
-the remote side using that algorithm.
 
 SEE ALSO
 --------

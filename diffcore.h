@@ -4,9 +4,11 @@
 #ifndef DIFFCORE_H
 #define DIFFCORE_H
 
-#include "cache.h"
+#include "hash.h"
 
 struct diff_options;
+struct mem_pool;
+struct oid_array;
 struct repository;
 struct strintmap;
 struct strmap;
@@ -151,11 +153,10 @@ struct diff_queue_struct {
 	int nr;
 };
 
-#define DIFF_QUEUE_CLEAR(q) \
-	do { \
-		(q)->queue = NULL; \
-		(q)->nr = (q)->alloc = 0; \
-	} while (0)
+#define DIFF_QUEUE_INIT { 0 }
+
+void diff_queue_init(struct diff_queue_struct *q);
+void diff_queue_clear(struct diff_queue_struct *q);
 
 extern struct diff_queue_struct diff_queued_diff;
 struct diff_filepair *diff_queue(struct diff_queue_struct *,

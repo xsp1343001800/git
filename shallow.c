@@ -1,20 +1,26 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "hex.h"
 #include "repository.h"
 #include "tempfile.h"
 #include "lockfile.h"
-#include "object-store.h"
+#include "object-store-ll.h"
 #include "commit.h"
 #include "tag.h"
 #include "pkt-line.h"
-#include "remote.h"
 #include "refs.h"
 #include "oid-array.h"
+#include "path.h"
 #include "diff.h"
 #include "revision.h"
 #include "commit-slab.h"
 #include "list-objects.h"
 #include "commit-reach.h"
 #include "shallow.h"
+#include "statinfo.h"
+#include "trace.h"
 
 void set_alternate_shallow_file(struct repository *r, const char *path, int override)
 {
@@ -30,12 +36,14 @@ int register_shallow(struct repository *r, const struct object_id *oid)
 {
 	struct commit_graft *graft =
 		xmalloc(sizeof(struct commit_graft));
-	struct commit *commit = lookup_commit(the_repository, oid);
+	struct commit *commit = lookup_commit(r, oid);
 
 	oidcpy(&graft->oid, oid);
 	graft->nr_parent = -1;
-	if (commit && commit->object.parsed)
+	if (commit && commit->object.parsed) {
+		free_commit_list(commit->parents);
 		commit->parents = NULL;
+	}
 	return register_commit_graft(r, graft, 0);
 }
 
@@ -44,6 +52,7 @@ int unregister_shallow(const struct object_id *oid)
 	int pos = commit_graft_pos(the_repository, oid);
 	if (pos < 0)
 		return -1;
+	free(the_repository->parsed_objects->grafts[pos]);
 	if (pos + 1 < the_repository->parsed_objects->grafts_nr)
 		MOVE_ARRAY(the_repository->parsed_objects->grafts + pos,
 			   the_repository->parsed_objects->grafts + pos + 1,
@@ -90,12 +99,20 @@ static void reset_repository_shallow(struct repository *r)
 {
 	r->parsed_objects->is_shallow = -1;
 	stat_validity_clear(r->parsed_objects->shallow_stat);
+	parsed_object_pool_reset_commit_grafts(r->parsed_objects);
 }
 
 int commit_shallow_file(struct repository *r, struct shallow_lock *lk)
 {
 	int res = commit_lock_file(&lk->lock);
 	reset_repository_shallow(r);
+
+	/*
+	 * Update in-memory data structures with the new shallow information,
+	 * including unparsing all commits that now have grafts.
+	 */
+	is_repository_shallow(r);
+
 	return res;
 }
 
@@ -239,7 +256,7 @@ struct commit_list *get_shallow_commits_by_rev_list(int ac, const char **av,
 		struct commit *c = p->item;
 		struct commit_list *parent;
 
-		if (parse_commit(c))
+		if (repo_parse_commit(the_repository, c))
 			die("unable to parse commit %s",
 			    oid_to_hex(&c->object.oid));
 
@@ -261,6 +278,7 @@ struct commit_list *get_shallow_commits_by_rev_list(int ac, const char **av,
 		if ((o->flags & both_flags) == both_flags)
 			o->flags &= ~not_shallow_flag;
 	}
+	release_revisions(&revs);
 	return result;
 }
 
@@ -292,7 +310,7 @@ static int write_one_shallow(const struct commit_graft *graft, void *cb_data)
 	if (graft->nr_parent != -1)
 		return 0;
 	if (data->flags & QUICK) {
-		if (!has_object_file(&graft->oid))
+		if (!repo_has_object_file(the_repository, &graft->oid))
 			return 0;
 	} else if (data->flags & SEEN_ONLY) {
 		struct commit *c = lookup_commit(the_repository, &graft->oid);
@@ -457,7 +475,7 @@ void prepare_shallow_info(struct shallow_info *info, struct oid_array *sa)
 	ALLOC_ARRAY(info->ours, sa->nr);
 	ALLOC_ARRAY(info->theirs, sa->nr);
 	for (i = 0; i < sa->nr; i++) {
-		if (has_object_file(sa->oid + i)) {
+		if (repo_has_object_file(the_repository, sa->oid + i)) {
 			struct commit_graft *graft;
 			graft = lookup_commit_graft(the_repository,
 						    &sa->oid[i]);
@@ -471,6 +489,15 @@ void prepare_shallow_info(struct shallow_info *info, struct oid_array *sa)
 
 void clear_shallow_info(struct shallow_info *info)
 {
+	if (info->used_shallow) {
+		for (size_t i = 0; i < info->shallow->nr; i++)
+			free(info->used_shallow[i]);
+		free(info->used_shallow);
+	}
+
+	free(info->need_reachability_test);
+	free(info->reachable);
+	free(info->shallow_ref);
 	free(info->ours);
 	free(info->theirs);
 }
@@ -485,7 +512,7 @@ void remove_nonexistent_theirs_shallow(struct shallow_info *info)
 	for (i = dst = 0; i < info->nr_theirs; i++) {
 		if (i != dst)
 			info->theirs[dst] = info->theirs[i];
-		if (has_object_file(oid + info->theirs[i]))
+		if (repo_has_object_file(the_repository, oid + info->theirs[i]))
 			dst++;
 	}
 	info->nr_theirs = dst;
@@ -559,7 +586,7 @@ static void paint_down(struct paint_info *info, const struct object_id *oid,
 		else
 			c->object.flags |= SEEN;
 
-		if (*refs == NULL)
+		if (!*refs)
 			*refs = bitmap;
 		else {
 			memcpy(tmp, *refs, bitmap_size);
@@ -574,7 +601,7 @@ static void paint_down(struct paint_info *info, const struct object_id *oid,
 		if (c->object.flags & BOTTOM)
 			continue;
 
-		if (parse_commit(c))
+		if (repo_parse_commit(the_repository, c))
 			die("unable to parse commit %s",
 			    oid_to_hex(&c->object.oid));
 
@@ -595,15 +622,18 @@ static void paint_down(struct paint_info *info, const struct object_id *oid,
 	free(tmp);
 }
 
-static int mark_uninteresting(const char *refname, const struct object_id *oid,
-			      int flags, void *cb_data)
+static int mark_uninteresting(const char *refname UNUSED,
+			      const char *referent UNUSED,
+			      const struct object_id *oid,
+			      int flags UNUSED,
+			      void *cb_data UNUSED)
 {
 	struct commit *commit = lookup_commit_reference_gently(the_repository,
 							       oid, 1);
 	if (!commit)
 		return 0;
 	commit->object.flags |= UNINTERESTING;
-	mark_parents_uninteresting(commit);
+	mark_parents_uninteresting(NULL, commit);
 	return 0;
 }
 
@@ -662,8 +692,10 @@ void assign_shallow_commits_to_refs(struct shallow_info *info,
 	 * connect to old refs. If not (e.g. force ref updates) it'll
 	 * have to go down to the current shallow commits.
 	 */
-	head_ref(mark_uninteresting, NULL);
-	for_each_ref(mark_uninteresting, NULL);
+	refs_head_ref(get_main_ref_store(the_repository), mark_uninteresting,
+		      NULL);
+	refs_for_each_ref(get_main_ref_store(the_repository),
+			  mark_uninteresting, NULL);
 
 	/* Mark potential bottoms so we won't go out of bound */
 	for (i = 0; i < nr_shallow; i++) {
@@ -706,8 +738,11 @@ struct commit_array {
 	int nr, alloc;
 };
 
-static int add_ref(const char *refname, const struct object_id *oid,
-		   int flags, void *cb_data)
+static int add_ref(const char *refname UNUSED,
+		  const char *referent UNUSED,
+		   const struct object_id *oid,
+		   int flags UNUSED,
+		   void *cb_data)
 {
 	struct commit_array *ca = cb_data;
 	ALLOC_GROW(ca->commits, ca->nr + 1, ca->alloc);
@@ -764,8 +799,8 @@ static void post_assign_shallow(struct shallow_info *info,
 	info->nr_theirs = dst;
 
 	memset(&ca, 0, sizeof(ca));
-	head_ref(add_ref, &ca);
-	for_each_ref(add_ref, &ca);
+	refs_head_ref(get_main_ref_store(the_repository), add_ref, &ca);
+	refs_for_each_ref(get_main_ref_store(the_repository), add_ref, &ca);
 
 	/* Remove unreachable shallow commits from "ours" */
 	for (i = dst = 0; i < info->nr_ours; i++) {
@@ -776,12 +811,16 @@ static void post_assign_shallow(struct shallow_info *info,
 		if (!*bitmap)
 			continue;
 		for (j = 0; j < bitmap_nr; j++)
-			if (bitmap[0][j] &&
-			    /* Step 7, reachability test at commit level */
-			    !in_merge_bases_many(c, ca.nr, ca.commits)) {
-				update_refstatus(ref_status, info->ref->nr, *bitmap);
-				dst++;
-				break;
+			if (bitmap[0][j]) {
+				/* Step 7, reachability test at commit level */
+				int ret = repo_in_merge_bases_many(the_repository, c, ca.nr, ca.commits, 1);
+				if (ret < 0)
+					exit(128);
+				if (!ret) {
+					update_refstatus(ref_status, info->ref->nr, *bitmap);
+					dst++;
+					break;
+				}
 			}
 	}
 	info->nr_ours = dst;
@@ -800,15 +839,21 @@ int delayed_reachability_test(struct shallow_info *si, int c)
 			struct commit_array ca;
 
 			memset(&ca, 0, sizeof(ca));
-			head_ref(add_ref, &ca);
-			for_each_ref(add_ref, &ca);
+			refs_head_ref(get_main_ref_store(the_repository),
+				      add_ref, &ca);
+			refs_for_each_ref(get_main_ref_store(the_repository),
+					  add_ref, &ca);
 			si->commits = ca.commits;
 			si->nr_commits = ca.nr;
 		}
 
-		si->reachable[c] = in_merge_bases_many(commit,
-						       si->nr_commits,
-						       si->commits);
+		si->reachable[c] = repo_in_merge_bases_many(the_repository,
+							    commit,
+							    si->nr_commits,
+							    si->commits,
+							    1);
+		if (si->reachable[c] < 0)
+			exit(128);
 		si->need_reachability_test[c] = 0;
 	}
 	return si->reachable[c];

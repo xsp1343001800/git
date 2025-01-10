@@ -4,6 +4,10 @@ test_description='grep icase on non-English locales'
 
 . ./lib-gettext.sh
 
+doalarm () {
+	perl -e 'alarm shift; exec @ARGV' -- "$@"
+}
+
 test_expect_success GETTEXT_LOCALE 'setup' '
 	test_write_lines "TILRAUN: Halló Heimur!" >file &&
 	git add file &&
@@ -11,9 +15,19 @@ test_expect_success GETTEXT_LOCALE 'setup' '
 	export LC_ALL
 '
 
-test_have_prereq GETTEXT_LOCALE &&
-test-tool regex "HALLÓ" "Halló" ICASE &&
-test_set_prereq REGEX_LOCALE
+test_expect_success GETTEXT_LOCALE 'setup REGEX_LOCALE prerequisite' '
+	# This "test-tool" invocation is identical...
+	if test-tool regex "HALLÓ" "Halló" ICASE
+	then
+		test_set_prereq REGEX_LOCALE
+	else
+
+		# ... to this one, but this way "test_must_fail" will
+		# tell a segfault or abort() from the regexec() test
+		# itself
+		test_must_fail test-tool regex "HALLÓ" "Halló" ICASE
+	fi
+'
 
 test_expect_success REGEX_LOCALE 'grep literal string, no -F' '
 	git grep -i "TILRAUN: Halló Heimur!" &&
@@ -50,54 +64,6 @@ test_expect_success REGEX_LOCALE 'pickaxe -i on non-ascii' '
 	git commit -m first &&
 	git log --format=%f -i -S"TILRAUN: HALLÓ HEIMUR!" >actual &&
 	echo first >expected &&
-	test_cmp expected actual
-'
-
-test_expect_success GETTEXT_LOCALE,PCRE 'log --author with an ascii pattern on UTF-8 data' '
-	cat >expected <<-\EOF &&
-	Author: <BOLD;RED>À Ú Thor<RESET> <author@example.com>
-	EOF
-	test_write_lines "forth" >file4 &&
-	git add file4 &&
-	git commit --author="À Ú Thor <author@example.com>" -m sécond &&
-	git log -1 --color=always --perl-regexp --author=".*Thor" >log &&
-	grep Author log >actual.raw &&
-	test_decode_color <actual.raw >actual &&
-	test_cmp expected actual
-'
-
-test_expect_success GETTEXT_LOCALE,PCRE 'log --committer with an ascii pattern on ISO-8859-1 data' '
-	cat >expected <<-\EOF &&
-	Commit:     Ç<BOLD;RED> O Mîtter <committer@example.com><RESET>
-	EOF
-	test_write_lines "fifth" >file5 &&
-	git add file5 &&
-	GIT_COMMITTER_NAME="Ç O Mîtter" &&
-	GIT_COMMITTER_EMAIL="committer@example.com" &&
-	git -c i18n.commitEncoding=latin1 commit -m thïrd &&
-	git -c i18n.logOutputEncoding=latin1 log -1 --pretty=fuller --color=always --perl-regexp --committer=" O.*" >log &&
-	grep Commit: log >actual.raw &&
-	test_decode_color <actual.raw >actual &&
-	test_cmp expected actual
-'
-
-test_expect_success GETTEXT_LOCALE,PCRE 'log --grep with an ascii pattern on UTF-8 data' '
-	cat >expected <<-\EOF &&
-	    sé<BOLD;RED>con<RESET>d
-	EOF
-	git log -1 --color=always --perl-regexp --grep="con" >log &&
-	grep con log >actual.raw &&
-	test_decode_color <actual.raw >actual &&
-	test_cmp expected actual
-'
-
-test_expect_success GETTEXT_LOCALE,PCRE 'log --grep with an ascii pattern on ISO-8859-1 data' '
-	cat >expected <<-\EOF &&
-	    <BOLD;RED>thïrd<RESET>
-	EOF
-	git -c i18n.logOutputEncoding=latin1 log -1 --color=always --perl-regexp --grep="th.*rd" >log &&
-	grep "th.*rd" log >actual.raw &&
-	test_decode_color <actual.raw >actual &&
 	test_cmp expected actual
 '
 
@@ -169,6 +135,18 @@ test_expect_success GETTEXT_LOCALE,LIBPCRE2,PCRE2_MATCH_INVALID_UTF 'PCRE v2: gr
 	test_cmp invalid-0xe5 actual &&
 	git grep -hi "(*NO_JIT)aÆ" invalid-0xe5 >actual &&
 	test_cmp invalid-0xe5 actual
+'
+
+test_expect_success GETTEXT_LOCALE,LIBPCRE2 'PCRE v2: grep non-literal ASCII from UTF-8' '
+	git grep --perl-regexp -h -o -e ll. file >actual &&
+	echo "lló" >expected &&
+	test_cmp expected actual
+'
+
+test_expect_success GETTEXT_LOCALE,LIBPCRE2 'PCRE v2: grep avoid endless loop bug' '
+	echo " Halló" >leading-whitespace &&
+	git add leading-whitespace &&
+	doalarm 1 git grep --perl-regexp "^\s" leading-whitespace
 '
 
 test_done

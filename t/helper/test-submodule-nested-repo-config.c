@@ -1,4 +1,8 @@
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "test-tool.h"
+#include "repository.h"
+#include "setup.h"
 #include "submodule-config.h"
 
 static void die_usage(const char **argv, const char *msg)
@@ -25,6 +29,6 @@ int cmd__submodule_nested_repo_config(int argc, const char **argv)
 	print_config_from_gitmodules(&subrepo, argv[2]);
 
 	submodule_free(the_repository);
-
+	repo_clear(&subrepo);
 	return 0;
 }

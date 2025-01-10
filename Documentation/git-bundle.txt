@@ -9,7 +9,7 @@ git-bundle - Move objects and refs by archive
 SYNOPSIS
 --------
 [verse]
-'git bundle' create [-q | --quiet | --progress | --all-progress] [--all-progress-implied]
+'git bundle' create [-q | --quiet | --progress]
 		    [--version=<version>] <file> <git-rev-list-args>
 'git bundle' verify [-q | --quiet] <file>
 'git bundle' list-heads <file> [<refname>...]
@@ -23,18 +23,17 @@ the "offline" transfer of Git objects without an active "server"
 sitting on the other side of the network connection.
 
 They can be used to create both incremental and full backups of a
-repository, and to relay the state of the references in one repository
-to another.
+repository (see the "full backup" example in "EXAMPLES"), and to relay
+the state of the references in one repository to another (see the second
+example).
 
 Git commands that fetch or otherwise "read" via protocols such as
 `ssh://` and `https://` can also operate on bundle files. It is
 possible linkgit:git-clone[1] a new repository from a bundle, to use
 linkgit:git-fetch[1] to fetch from one, and to list the references
 contained within it with linkgit:git-ls-remote[1]. There's no
-corresponding "write" support, i.e.a 'git push' into a bundle is not
+corresponding "write" support, i.e. a 'git push' into a bundle is not
 supported.
-
-See the "EXAMPLES" section below for examples of how to use bundles.
 
 BUNDLE FORMAT
 -------------
@@ -42,7 +41,7 @@ BUNDLE FORMAT
 Bundles are `.pack` files (see linkgit:git-pack-objects[1]) with a
 header indicating what references are contained within the bundle.
 
-Like the the packed archive format itself bundles can either be
+Like the packed archive format itself bundles can either be
 self-contained, or be created using exclusions.
 See the "OBJECT PREREQUISITES" section below.
 
@@ -56,10 +55,8 @@ using "thin packs", bundles created using exclusions are smaller in
 size. That they're "thin" under the hood is merely noted here as a
 curiosity, and as a reference to other documentation.
 
-See link:technical/bundle-format.html[the `bundle-format`
-documentation] for more details and the discussion of "thin pack" in
-link:technical/pack-format.html[the pack format documentation] for
-further details.
+See linkgit:gitformat-bundle[5] for more details and the discussion of
+"thin pack" in linkgit:gitformat-pack[5] for further details.
 
 OPTIONS
 -------
@@ -68,20 +65,24 @@ create [options] <file> <git-rev-list-args>::
 	Used to create a bundle named 'file'.  This requires the
 	'<git-rev-list-args>' arguments to define the bundle contents.
 	'options' contains the options specific to the 'git bundle create'
-	subcommand.
+	subcommand. If 'file' is `-`, the bundle is written to stdout.
 
 verify <file>::
 	Used to check that a bundle file is valid and will apply
 	cleanly to the current repository.  This includes checks on the
 	bundle format itself as well as checking that the prerequisite
 	commits exist and are fully linked in the current repository.
-	'git bundle' prints a list of missing commits, if any, and exits
-	with a non-zero status.
+	Then, 'git bundle' prints a list of missing commits, if any.
+	Finally, information about additional capabilities, such as "object
+	filter", is printed. See "Capabilities" in linkgit:gitformat-bundle[5]
+	for more information. The exit code is zero for success, but will
+	be nonzero if the bundle file is invalid. If 'file' is `-`, the
+	bundle is read from stdin.
 
 list-heads <file>::
 	Lists the references defined in the bundle.  If followed by a
 	list of references, only references matching those given are
-	printed out.
+	printed out. If 'file' is `-`, the bundle is read from stdin.
 
 unbundle <file>::
 	Passes the objects in the bundle to 'git index-pack'
@@ -89,6 +90,7 @@ unbundle <file>::
 	defined references. If a list of references is given, only
 	references matching those in the list are printed. This command is
 	really plumbing, intended to be called only by 'git fetch'.
+	If 'file' is `-`, the bundle is read from stdin.
 
 <git-rev-list-args>::
 	A list of arguments, acceptable to 'git rev-parse' and
@@ -114,22 +116,6 @@ unbundle <file>::
 	is specified. This flag forces progress status even if
 	the standard error stream is not directed to a terminal.
 
---all-progress::
-	When --stdout is specified then progress report is
-	displayed during the object count and compression phases
-	but inhibited during the write-out phase. The reason is
-	that in some cases the output stream is directly linked
-	to another command which may wish to display progress
-	status of its own as it processes incoming pack data.
-	This flag is like --progress except that it forces progress
-	report for the write-out phase as well even if --stdout is
-	used.
-
---all-progress-implied::
-	This is used to imply --all-progress whenever progress display
-	is activated.  Unlike --all-progress this flag doesn't actually
-	force any progress display by itself.
-
 --version=<version>::
 	Specify the bundle version.  Version 2 is the older format and can only be
 	used with SHA-1 repositories; the newer version 3 contains capabilities that
@@ -145,7 +131,7 @@ SPECIFYING REFERENCES
 ---------------------
 
 Revisions must be accompanied by reference names to be packaged in a
-bundle.
+bundle.  Alternatively `--all` can be used to package all refs.
 
 More than one reference may be packaged, and more than one set of prerequisite objects can
 be specified.  The objects packaged are those not contained in the
@@ -216,8 +202,6 @@ It is okay to err on the side of caution, causing the bundle file
 to contain objects already in the destination, as these are ignored
 when unpacking at the destination.
 
-If you want to match `git clone --mirror`, which would include your
-refs such as `refs/remotes/*`, use `--all`.
 If you want to provide the same set of refs that a clone directly
 from the source repository would get, use `--branches --tags` for
 the `<git-rev-list-args>`.
@@ -229,8 +213,34 @@ bundle.
 EXAMPLES
 --------
 
-Assume you want to transfer the history from a repository R1 on machine A
-to another repository R2 on machine B.
+We'll discuss two cases:
+
+1. Taking a full backup of a repository
+2. Transferring the history of a repository to another machine when the
+   two machines have no direct connection
+
+First let's consider a full backup of the repository.  The following
+command will take a full backup of the repository in the sense that all
+refs are included in the bundle:
+
+----------------
+$ git bundle create backup.bundle --all
+----------------
+
+But note again that this is only for the refs, i.e. you will only
+include refs and commits reachable from those refs.  You will not
+include other local state, such as the contents of the index, working
+tree, the stash, per-repository configuration, hooks, etc.
+
+You can later recover that repository by using for example
+linkgit:git-clone[1]:
+
+----------------
+$ git clone backup.bundle <new directory>
+----------------
+
+For the next example, assume you want to transfer the history from a
+repository R1 on machine A to another repository R2 on machine B.
 For whatever reason, direct connection between A and B is not allowed,
 but we can move data from A to B via some mechanism (CD, email, etc.).
 We want to update R2 with development made on the branch master in R1.
@@ -333,6 +343,29 @@ You can also see what references it offers:
 ----------------
 $ git ls-remote mybundle
 ----------------
+
+DISCUSSION
+----------
+
+A naive way to make a full backup of a repository is to use something to
+the effect of `cp -r <repo> <destination>`.  This is discouraged since
+the repository could be written to during the copy operation.  In turn
+some files at `<destination>` could be corrupted.
+
+This is why it is recommended to use Git tooling for making repository
+backups, either with this command or with e.g. linkgit:git-clone[1].
+But keep in mind that these tools will not help you backup state other
+than refs and commits.  In other words they will not help you backup
+contents of the index, working tree, the stash, per-repository
+configuration, hooks, etc.
+
+See also linkgit:gitfaq[7], section "TRANSFERS" for a discussion of the
+problems associated with file syncing across systems.
+
+FILE FORMAT
+-----------
+
+See linkgit:gitformat-bundle[5].
 
 GIT
 ---

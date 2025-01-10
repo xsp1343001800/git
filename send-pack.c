@@ -1,21 +1,26 @@
-#include "builtin.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
 #include "config.h"
 #include "commit.h"
-#include "refs.h"
-#include "object-store.h"
+#include "date.h"
+#include "gettext.h"
+#include "hex.h"
+#include "object-store-ll.h"
 #include "pkt-line.h"
 #include "sideband.h"
 #include "run-command.h"
 #include "remote.h"
 #include "connect.h"
 #include "send-pack.h"
-#include "quote.h"
 #include "transport.h"
 #include "version.h"
 #include "oid-array.h"
 #include "gpg-interface.h"
-#include "cache.h"
 #include "shallow.h"
+#include "parse-options.h"
+#include "trace2.h"
+#include "write-or-die.h"
 
 int option_parse_push_signed(const struct option *opt,
 			     const char *arg, int unset)
@@ -42,9 +47,9 @@ int option_parse_push_signed(const struct option *opt,
 static void feed_object(const struct object_id *oid, FILE *fh, int negative)
 {
 	if (negative &&
-	    !has_object_file_with_flags(oid,
-					OBJECT_INFO_SKIP_FETCH_OBJECT |
-					OBJECT_INFO_QUICK))
+	    !repo_has_object_file_with_flags(the_repository, oid,
+					     OBJECT_INFO_SKIP_FETCH_OBJECT |
+					     OBJECT_INFO_QUICK))
 		return;
 
 	if (negative)
@@ -67,9 +72,9 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *advertised,
 	 */
 	struct child_process po = CHILD_PROCESS_INIT;
 	FILE *po_in;
-	int i;
 	int rc;
 
+	trace2_region_enter("send_pack", "pack_objects", the_repository);
 	strvec_push(&po.args, "pack-objects");
 	strvec_push(&po.args, "--all-progress-implied");
 	strvec_push(&po.args, "--revs");
@@ -84,6 +89,8 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *advertised,
 		strvec_push(&po.args, "--progress");
 	if (is_repository_shallow(the_repository))
 		strvec_push(&po.args, "--shallow");
+	if (args->disable_bitmaps)
+		strvec_push(&po.args, "--no-use-bitmap-index");
 	po.in = -1;
 	po.out = args->stateless_rpc ? -1 : fd;
 	po.git_cmd = 1;
@@ -96,9 +103,9 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *advertised,
 	 * parameters by writing to the pipe.
 	 */
 	po_in = xfdopen(po.in, "w");
-	for (i = 0; i < advertised->nr; i++)
+	for (size_t i = 0; i < advertised->nr; i++)
 		feed_object(&advertised->oid[i], po_in, 1);
-	for (i = 0; i < negotiated->nr; i++)
+	for (size_t i = 0; i < negotiated->nr; i++)
 		feed_object(&negotiated->oid[i], po_in, 1);
 
 	while (refs) {
@@ -139,8 +146,10 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *advertised,
 		 */
 		if (rc > 128 && rc != 141)
 			error("pack-objects died of signal %d", rc - 128);
+		trace2_region_leave("send_pack", "pack_objects", the_repository);
 		return -1;
 	}
+	trace2_region_leave("send_pack", "pack_objects", the_repository);
 	return 0;
 }
 
@@ -163,6 +172,7 @@ static int receive_status(struct packet_reader *reader, struct ref *refs)
 	int new_report = 0;
 	int once = 0;
 
+	trace2_region_enter("send_pack", "receive_status", the_repository);
 	hint = NULL;
 	ret = receive_unpack_status(reader);
 	while (1) {
@@ -254,17 +264,18 @@ static int receive_status(struct packet_reader *reader, struct ref *refs)
 			if (p)
 				hint->remote_status = xstrdup(p);
 			else
-				hint->remote_status = "failed";
+				hint->remote_status = xstrdup("failed");
 		} else {
 			hint->status = REF_STATUS_OK;
 			hint->remote_status = xstrdup_or_null(p);
 			new_report = 1;
 		}
 	}
+	trace2_region_leave("send_pack", "receive_status", the_repository);
 	return ret;
 }
 
-static int sideband_demux(int in, int out, void *data)
+static int sideband_demux(int in UNUSED, int out, void *data)
 {
 	int *fd = data, ret;
 	if (async_with_fork())
@@ -341,7 +352,8 @@ static int generate_push_cert(struct strbuf *req_buf,
 {
 	const struct ref *ref;
 	struct string_list_item *item;
-	char *signing_key_id = xstrdup(get_signing_key_id());
+	char *signing_key_id = get_signing_key_id();
+	char *signing_key = get_signing_key();
 	const char *cp, *np;
 	struct strbuf cert = STRBUF_INIT;
 	int update_seen = 0;
@@ -374,7 +386,7 @@ static int generate_push_cert(struct strbuf *req_buf,
 	if (!update_seen)
 		goto free_return;
 
-	if (sign_buffer(&cert, &cert, get_signing_key()))
+	if (sign_buffer(&cert, &cert, signing_key))
 		die(_("failed to sign the push certificate"));
 
 	packet_buf_write(req_buf, "push-cert%c%s", 0, cap_string);
@@ -387,6 +399,7 @@ static int generate_push_cert(struct strbuf *req_buf,
 
 free_return:
 	free(signing_key_id);
+	free(signing_key);
 	strbuf_release(&cert);
 	return update_seen;
 }
@@ -420,16 +433,25 @@ static void get_commons_through_negotiation(const char *url,
 	struct child_process child = CHILD_PROCESS_INIT;
 	const struct ref *ref;
 	int len = the_hash_algo->hexsz + 1; /* hash + NL */
+	int nr_negotiation_tip = 0;
 
 	child.git_cmd = 1;
 	child.no_stdin = 1;
 	child.out = -1;
 	strvec_pushl(&child.args, "fetch", "--negotiate-only", NULL);
 	for (ref = remote_refs; ref; ref = ref->next) {
-		if (!is_null_oid(&ref->new_oid))
-			strvec_pushf(&child.args, "--negotiation-tip=%s", oid_to_hex(&ref->new_oid));
+		if (!is_null_oid(&ref->new_oid)) {
+			strvec_pushf(&child.args, "--negotiation-tip=%s",
+				     oid_to_hex(&ref->new_oid));
+			nr_negotiation_tip++;
+		}
 	}
 	strvec_push(&child.args, url);
+
+	if (!nr_negotiation_tip) {
+		child_process_clear(&child);
+		return;
+	}
 
 	if (start_command(&child))
 		die(_("send-pack: unable to fork off fetch subprocess"));
@@ -485,18 +507,26 @@ int send_pack(struct send_pack_args *args,
 	unsigned cmds_sent = 0;
 	int ret;
 	struct async demux;
-	const char *push_cert_nonce = NULL;
+	char *push_cert_nonce = NULL;
 	struct packet_reader reader;
+	int use_bitmaps;
 
 	if (!remote_refs) {
 		fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
 			"Perhaps you should specify a branch.\n");
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
 	git_config_get_bool("push.negotiate", &push_negotiate);
-	if (push_negotiate)
+	if (push_negotiate) {
+		trace2_region_enter("send_pack", "push_negotiate", the_repository);
 		get_commons_through_negotiation(args->url, remote_refs, &commons);
+		trace2_region_leave("send_pack", "push_negotiate", the_repository);
+	}
+
+	if (!git_config_get_bool("push.usebitmaps", &use_bitmaps))
+		args->disable_bitmaps = !use_bitmaps;
 
 	git_config_get_bool("transfer.advertisesid", &advertise_sid);
 
@@ -528,11 +558,12 @@ int send_pack(struct send_pack_args *args,
 		die(_("the receiving end does not support this repository's hash algorithm"));
 
 	if (args->push_cert != SEND_PACK_PUSH_CERT_NEVER) {
-		int len;
-		push_cert_nonce = server_feature_value("push-cert", &len);
-		if (push_cert_nonce) {
-			reject_invalid_nonce(push_cert_nonce, len);
-			push_cert_nonce = xmemdupz(push_cert_nonce, len);
+		size_t len;
+		const char *nonce = server_feature_value("push-cert", &len);
+
+		if (nonce) {
+			reject_invalid_nonce(nonce, len);
+			push_cert_nonce = xmemdupz(nonce, len);
 		} else if (args->push_cert == SEND_PACK_PUSH_CERT_ALWAYS) {
 			die(_("the receiving end does not support --signed push"));
 		} else if (args->push_cert == SEND_PACK_PUSH_CERT_IF_ASKED) {
@@ -595,12 +626,11 @@ int send_pack(struct send_pack_args *args,
 			 * atomically, abort the whole operation.
 			 */
 			if (use_atomic) {
-				strbuf_release(&req_buf);
-				strbuf_release(&cap_buf);
 				reject_atomic_push(remote_refs, args->send_mirror);
-				error("atomic push failed for ref %s. status: %d\n",
+				error("atomic push failed for ref %s. status: %d",
 				      ref->name, ref->status);
-				return args->porcelain ? 0 : -1;
+				ret = args->porcelain ? 0 : -1;
+				goto out;
 			}
 			/* else fallthrough */
 		default:
@@ -621,10 +651,11 @@ int send_pack(struct send_pack_args *args,
 	/*
 	 * Finally, tell the other end!
 	 */
-	if (!args->dry_run && push_cert_nonce)
+	if (!args->dry_run && push_cert_nonce) {
 		cmds_sent = generate_push_cert(&req_buf, remote_refs, args,
 					       cap_buf.buf, push_cert_nonce);
-	else if (!args->dry_run)
+		trace2_printf("Generated push certificate");
+	} else if (!args->dry_run) {
 		for (ref = remote_refs; ref; ref = ref->next) {
 			char *old_hex, *new_hex;
 
@@ -644,6 +675,7 @@ int send_pack(struct send_pack_args *args,
 						 old_hex, new_hex, ref->name);
 			}
 		}
+	}
 
 	if (use_push_options) {
 		struct string_list_item *item;
@@ -662,8 +694,6 @@ int send_pack(struct send_pack_args *args,
 		write_or_die(out, req_buf.buf, req_buf.len);
 		packet_flush(out);
 	}
-	strbuf_release(&req_buf);
-	strbuf_release(&cap_buf);
 
 	if (use_sideband && cmds_sent) {
 		memset(&demux, 0, sizeof(demux));
@@ -701,7 +731,9 @@ int send_pack(struct send_pack_args *args,
 				finish_async(&demux);
 			}
 			fd[1] = -1;
-			return -1;
+
+			ret = -1;
+			goto out;
 		}
 		if (!args->stateless_rpc)
 			/* Closed by pack_objects() via start_command() */
@@ -726,10 +758,12 @@ int send_pack(struct send_pack_args *args,
 	}
 
 	if (ret < 0)
-		return ret;
+		goto out;
 
-	if (args->porcelain)
-		return 0;
+	if (args->porcelain) {
+		ret = 0;
+		goto out;
+	}
 
 	for (ref = remote_refs; ref; ref = ref->next) {
 		switch (ref->status) {
@@ -738,8 +772,17 @@ int send_pack(struct send_pack_args *args,
 		case REF_STATUS_OK:
 			break;
 		default:
-			return -1;
+			ret = -1;
+			goto out;
 		}
 	}
-	return 0;
+
+	ret = 0;
+
+out:
+	oid_array_clear(&commons);
+	strbuf_release(&req_buf);
+	strbuf_release(&cap_buf);
+	free(push_cert_nonce);
+	return ret;
 }

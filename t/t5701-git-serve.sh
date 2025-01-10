@@ -12,16 +12,18 @@ test_expect_success 'test capability advertisement' '
 	wrong_algo sha1:sha256
 	wrong_algo sha256:sha1
 	EOF
-	cat >expect <<-EOF &&
+	cat >expect.base <<-EOF &&
 	version 2
 	agent=git/$(git version | cut -d" " -f3)
 	ls-refs=unborn
 	fetch=shallow wait-for-done
 	server-option
 	object-format=$(test_oid algo)
-	object-info
+	EOF
+	cat >expect.trailer <<-EOF &&
 	0000
 	EOF
+	cat expect.base expect.trailer >expect &&
 
 	GIT_TEST_SIDEBAND_ALL=0 test-tool serve-v2 \
 		--advertise-capabilities >out &&
@@ -48,7 +50,7 @@ test_expect_success 'request invalid capability' '
 	0000
 	EOF
 	test_must_fail test-tool serve-v2 --stateless-rpc 2>err <in &&
-	test_i18ngrep "unknown capability" err
+	test_grep "unknown capability" err
 '
 
 test_expect_success 'request with no command' '
@@ -58,7 +60,7 @@ test_expect_success 'request with no command' '
 	0000
 	EOF
 	test_must_fail test-tool serve-v2 --stateless-rpc 2>err <in &&
-	test_i18ngrep "no command requested" err
+	test_grep "no command requested" err
 '
 
 test_expect_success 'request invalid command' '
@@ -69,7 +71,7 @@ test_expect_success 'request invalid command' '
 	0000
 	EOF
 	test_must_fail test-tool serve-v2 --stateless-rpc 2>err <in &&
-	test_i18ngrep "invalid command" err
+	test_grep "invalid command" err
 '
 
 test_expect_success 'request capability as command' '
@@ -111,7 +113,7 @@ test_expect_success 'wrong object-format' '
 	0000
 	EOF
 	test_must_fail test-tool serve-v2 --stateless-rpc 2>err <in &&
-	test_i18ngrep "mismatched object format" err
+	test_grep "mismatched object format" err
 '
 
 # Test the basics of ls-refs
@@ -319,6 +321,8 @@ test_expect_success 'unexpected lines are not allowed in fetch request' '
 # Test the basics of object-info
 #
 test_expect_success 'basics of object-info' '
+	test_config transfer.advertiseObjectInfo true &&
+
 	test-tool pkt-line pack >in <<-EOF &&
 	command=object-info
 	object-format=$(test_oid algo)
@@ -339,6 +343,62 @@ test_expect_success 'basics of object-info' '
 	test-tool serve-v2 --stateless-rpc <in >out &&
 	test-tool pkt-line unpack <out >actual &&
 	test_cmp expect actual
+'
+
+test_expect_success 'test capability advertisement with uploadpack.advertiseBundleURIs' '
+	test_config uploadpack.advertiseBundleURIs true &&
+
+	cat >expect.extra <<-EOF &&
+	bundle-uri
+	EOF
+	cat expect.base \
+	    expect.extra \
+	    expect.trailer >expect &&
+
+	GIT_TEST_SIDEBAND_ALL=0 test-tool serve-v2 \
+		--advertise-capabilities >out &&
+	test-tool pkt-line unpack <out >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'basics of bundle-uri: dies if not enabled' '
+	test-tool pkt-line pack >in <<-EOF &&
+	command=bundle-uri
+	0000
+	EOF
+
+	cat >err.expect <<-\EOF &&
+	fatal: invalid command '"'"'bundle-uri'"'"'
+	EOF
+
+	cat >expect <<-\EOF &&
+	ERR serve: invalid command '"'"'bundle-uri'"'"'
+	EOF
+
+	test_must_fail test-tool serve-v2 --stateless-rpc <in >out 2>err.actual &&
+	test_cmp err.expect err.actual &&
+	test_must_be_empty out
+'
+
+test_expect_success 'object-info missing from capabilities when disabled' '
+	test_config transfer.advertiseObjectInfo false &&
+
+	GIT_TEST_SIDEBAND_ALL=0 test-tool serve-v2 \
+		--advertise-capabilities >out &&
+	test-tool pkt-line unpack <out >actual &&
+
+	! grep object.info actual
+'
+
+test_expect_success 'object-info commands rejected when disabled' '
+	test_config transfer.advertiseObjectInfo false &&
+
+	test-tool pkt-line pack >in <<-EOF &&
+	command=object-info
+	EOF
+
+	test_must_fail test-tool serve-v2 --stateless-rpc <in 2>err &&
+	grep invalid.command err
 '
 
 test_done

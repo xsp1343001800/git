@@ -8,11 +8,12 @@ export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 
 test_expect_success 'setup' '
 	mkdir parent &&
-	(cd parent &&
-	 git init &&
-	 echo content >file &&
-	 git add file &&
-	 git commit -m base
+	(
+		cd parent &&
+		git init &&
+		echo content >file &&
+		git add file &&
+		git commit -m base
 	) &&
 	git fetch parent main:origin
 '

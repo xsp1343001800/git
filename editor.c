@@ -1,9 +1,18 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
+#include "abspath.h"
+#include "advice.h"
 #include "config.h"
+#include "editor.h"
+#include "environment.h"
+#include "gettext.h"
+#include "pager.h"
+#include "path.h"
 #include "strbuf.h"
+#include "strvec.h"
 #include "run-command.h"
 #include "sigchain.h"
-#include "compat/terminal.h"
 
 #ifndef DEFAULT_EDITOR
 #define DEFAULT_EDITOR "vi"
@@ -51,14 +60,11 @@ const char *git_sequence_editor(void)
 static int launch_specified_editor(const char *editor, const char *path,
 				   struct strbuf *buffer, const char *const *env)
 {
-	int term_fail;
-
 	if (!editor)
 		return error("Terminal is dumb, but EDITOR unset");
 
 	if (strcmp(editor, ":")) {
 		struct strbuf realpath = STRBUF_INIT;
-		const char *args[] = { editor, NULL, NULL };
 		struct child_process p = CHILD_PROCESS_INIT;
 		int ret, sig;
 		int print_waiting_for_editor = advice_enabled(ADVICE_WAITING_FOR_EDITOR) && isatty(2);
@@ -80,16 +86,13 @@ static int launch_specified_editor(const char *editor, const char *path,
 		}
 
 		strbuf_realpath(&realpath, path, 1);
-		args[1] = realpath.buf;
 
-		p.argv = args;
-		p.env = env;
+		strvec_pushl(&p.args, editor, realpath.buf, NULL);
+		if (env)
+			strvec_pushv(&p.env, (const char **)env);
 		p.use_shell = 1;
 		p.trace2_child_class = "editor";
-		term_fail = save_term(1);
 		if (start_command(&p) < 0) {
-			if (!term_fail)
-				restore_term();
 			strbuf_release(&realpath);
 			return error("unable to start editor '%s'", editor);
 		}
@@ -97,24 +100,21 @@ static int launch_specified_editor(const char *editor, const char *path,
 		sigchain_push(SIGINT, SIG_IGN);
 		sigchain_push(SIGQUIT, SIG_IGN);
 		ret = finish_command(&p);
-		if (!term_fail)
-			restore_term();
 		strbuf_release(&realpath);
 		sig = ret - 128;
 		sigchain_pop(SIGINT);
 		sigchain_pop(SIGQUIT);
 		if (sig == SIGINT || sig == SIGQUIT)
 			raise(sig);
-		if (ret)
-			return error("There was a problem with the editor '%s'.",
-					editor);
-
 		if (print_waiting_for_editor && !is_terminal_dumb())
 			/*
 			 * Erase the entire line to avoid wasting the
 			 * vertical space.
 			 */
 			term_clear_line();
+		if (ret)
+			return error("there was a problem with the editor '%s'",
+					editor);
 	}
 
 	if (!buffer)
@@ -133,4 +133,35 @@ int launch_sequence_editor(const char *path, struct strbuf *buffer,
 			   const char *const *env)
 {
 	return launch_specified_editor(git_sequence_editor(), path, buffer, env);
+}
+
+int strbuf_edit_interactively(struct repository *r,
+			      struct strbuf *buffer, const char *path,
+			      const char *const *env)
+{
+	struct strbuf sb = STRBUF_INIT;
+	int fd, res = 0;
+
+	if (!is_absolute_path(path)) {
+		strbuf_repo_git_path(&sb, r, "%s", path);
+		path = sb.buf;
+	}
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0)
+		res = error_errno(_("could not open '%s' for writing"), path);
+	else if (write_in_full(fd, buffer->buf, buffer->len) < 0) {
+		res = error_errno(_("could not write to '%s'"), path);
+		close(fd);
+	} else if (close(fd) < 0)
+		res = error_errno(_("could not close '%s'"), path);
+	else {
+		strbuf_reset(buffer);
+		if (launch_editor(path, buffer, env) < 0)
+			res = error_errno(_("could not edit '%s'"), path);
+		unlink(path);
+	}
+
+	strbuf_release(&sb);
+	return res;
 }

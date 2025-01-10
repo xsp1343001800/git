@@ -4,9 +4,14 @@
  */
 
 #define PRECOMPOSE_UNICODE_C
+#define USE_THE_REPOSITORY_VARIABLE
 
-#include "cache.h"
+#include "git-compat-util.h"
 #include "config.h"
+#include "environment.h"
+#include "gettext.h"
+#include "path.h"
+#include "strbuf.h"
 #include "utf8.h"
 #include "precompose_utf8.h"
 

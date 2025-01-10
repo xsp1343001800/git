@@ -1,9 +1,16 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
+#include "gettext.h"
 #include "pack-revindex.h"
-#include "object-store.h"
+#include "object-file.h"
+#include "object-store-ll.h"
 #include "packfile.h"
-#include "config.h"
+#include "strbuf.h"
+#include "trace2.h"
+#include "parse.h"
 #include "midx.h"
+#include "csum-file.h"
 
 struct revindex_entry {
 	off_t offset;
@@ -204,10 +211,14 @@ static int load_revindex_from_disk(char *revindex_name,
 	size_t revindex_size;
 	struct revindex_header *hdr;
 
+	if (git_env_bool(GIT_TEST_REV_INDEX_DIE_ON_DISK, 0))
+		die("dying as requested by '%s'", GIT_TEST_REV_INDEX_DIE_ON_DISK);
+
 	fd = git_open(revindex_name);
 
 	if (fd < 0) {
-		ret = -1;
+		/* "No file" means return 1. */
+		ret = 1;
 		goto cleanup;
 	}
 	if (fstat(fd, &st)) {
@@ -259,7 +270,7 @@ cleanup:
 	return ret;
 }
 
-static int load_pack_revindex_from_disk(struct packed_git *p)
+int load_pack_revindex_from_disk(struct packed_git *p)
 {
 	char *revindex_name;
 	int ret;
@@ -282,28 +293,100 @@ cleanup:
 	return ret;
 }
 
-int load_pack_revindex(struct packed_git *p)
+int load_pack_revindex(struct repository *r, struct packed_git *p)
 {
 	if (p->revindex || p->revindex_data)
 		return 0;
 
-	if (!load_pack_revindex_from_disk(p))
+	prepare_repo_settings(r);
+
+	if (r->settings.pack_read_reverse_index &&
+	    !load_pack_revindex_from_disk(p))
 		return 0;
 	else if (!create_pack_revindex_in_memory(p))
 		return 0;
 	return -1;
 }
 
+/*
+ * verify_pack_revindex verifies that the on-disk rev-index for the given
+ * pack-file is the same that would be created if written from scratch.
+ *
+ * A negative number is returned on error.
+ */
+int verify_pack_revindex(struct packed_git *p)
+{
+	int res = 0;
+
+	/* Do not bother checking if not initialized. */
+	if (!p->revindex_map || !p->revindex_data)
+		return res;
+
+	if (!hashfile_checksum_valid((const unsigned char *)p->revindex_map, p->revindex_size)) {
+		error(_("invalid checksum"));
+		res = -1;
+	}
+
+	/* This may fail due to a broken .idx. */
+	if (create_pack_revindex_in_memory(p))
+		return res;
+
+	for (size_t i = 0; i < p->num_objects; i++) {
+		uint32_t nr = p->revindex[i].nr;
+		uint32_t rev_val = get_be32(p->revindex_data + i);
+
+		if (nr != rev_val) {
+			error(_("invalid rev-index position at %"PRIu64": %"PRIu32" != %"PRIu32""),
+			      (uint64_t)i, nr, rev_val);
+			res = -1;
+		}
+	}
+
+	return res;
+}
+
+static int can_use_midx_ridx_chunk(struct multi_pack_index *m)
+{
+	if (!m->chunk_revindex)
+		return 0;
+	if (m->chunk_revindex_len != st_mult(sizeof(uint32_t), m->num_objects)) {
+		error(_("multi-pack-index reverse-index chunk is the wrong size"));
+		return 0;
+	}
+	return 1;
+}
+
 int load_midx_revindex(struct multi_pack_index *m)
 {
-	char *revindex_name;
+	struct strbuf revindex_name = STRBUF_INIT;
 	int ret;
+
 	if (m->revindex_data)
 		return 0;
 
-	revindex_name = get_midx_rev_filename(m);
+	if (can_use_midx_ridx_chunk(m)) {
+		/*
+		 * If the MIDX `m` has a `RIDX` chunk, then use its contents for
+		 * the reverse index instead of trying to load a separate `.rev`
+		 * file.
+		 *
+		 * Note that we do *not* set `m->revindex_map` here, since we do
+		 * not want to accidentally call munmap() in the middle of the
+		 * MIDX.
+		 */
+		trace2_data_string("load_midx_revindex", the_repository,
+				   "source", "midx");
+		m->revindex_data = (const uint32_t *)m->chunk_revindex;
+		return 0;
+	}
 
-	ret = load_revindex_from_disk(revindex_name,
+	trace2_data_string("load_midx_revindex", the_repository,
+			   "source", "rev");
+
+	get_midx_filename_ext(m->repo->hash_algo, &revindex_name, m->object_dir,
+			      get_midx_checksum(m), MIDX_EXT_REV);
+
+	ret = load_revindex_from_disk(revindex_name.buf,
 				      m->num_objects,
 				      &m->revindex_map,
 				      &m->revindex_len);
@@ -313,7 +396,7 @@ int load_midx_revindex(struct multi_pack_index *m)
 	m->revindex_data = (const uint32_t *)((const char *)m->revindex_map + RIDX_HEADER_SIZE);
 
 cleanup:
-	free(revindex_name);
+	strbuf_release(&revindex_name);
 	return ret;
 }
 
@@ -335,7 +418,7 @@ int offset_to_pack_pos(struct packed_git *p, off_t ofs, uint32_t *pos)
 {
 	unsigned lo, hi;
 
-	if (load_pack_revindex(p) < 0)
+	if (load_pack_revindex(the_repository, p) < 0)
 		return -1;
 
 	lo = 0;
@@ -440,19 +523,15 @@ static int midx_pack_order_cmp(const void *va, const void *vb)
 	return 0;
 }
 
-int midx_to_pack_pos(struct multi_pack_index *m, uint32_t at, uint32_t *pos)
+static int midx_key_to_pack_pos(struct multi_pack_index *m,
+				struct midx_pack_key *key,
+				uint32_t *pos)
 {
-	struct midx_pack_key key;
 	uint32_t *found;
 
-	if (!m->revindex_data)
-		BUG("midx_to_pack_pos: reverse index not yet loaded");
-	if (m->num_objects <= at)
-		BUG("midx_to_pack_pos: out-of-bounds object at %"PRIu32, at);
-
-	key.pack = nth_midxed_pack_int_id(m, at);
-	key.offset = nth_midxed_offset(m, at);
-	key.midx = m;
+	if (key->pack >= m->num_packs)
+		BUG("MIDX pack lookup out of bounds (%"PRIu32" >= %"PRIu32")",
+		    key->pack, m->num_packs);
 	/*
 	 * The preferred pack sorts first, so determine its identifier by
 	 * looking at the first object in pseudo-pack order.
@@ -462,14 +541,43 @@ int midx_to_pack_pos(struct multi_pack_index *m, uint32_t at, uint32_t *pos)
 	 * implicitly is preferred (and includes all its objects, since ties are
 	 * broken first by pack identifier).
 	 */
-	key.preferred_pack = nth_midxed_pack_int_id(m, pack_pos_to_midx(m, 0));
+	if (midx_preferred_pack(key->midx, &key->preferred_pack) < 0)
+		return error(_("could not determine preferred pack"));
 
-	found = bsearch(&key, m->revindex_data, m->num_objects,
-			sizeof(*m->revindex_data), midx_pack_order_cmp);
+	found = bsearch(key, m->revindex_data, m->num_objects,
+			sizeof(*m->revindex_data),
+			midx_pack_order_cmp);
 
 	if (!found)
-		return error("bad offset for revindex");
+		return -1;
 
 	*pos = found - m->revindex_data;
 	return 0;
+}
+
+int midx_to_pack_pos(struct multi_pack_index *m, uint32_t at, uint32_t *pos)
+{
+	struct midx_pack_key key;
+
+	if (!m->revindex_data)
+		BUG("midx_to_pack_pos: reverse index not yet loaded");
+	if (m->num_objects <= at)
+		BUG("midx_to_pack_pos: out-of-bounds object at %"PRIu32, at);
+
+	key.pack = nth_midxed_pack_int_id(m, at);
+	key.offset = nth_midxed_offset(m, at);
+	key.midx = m;
+
+	return midx_key_to_pack_pos(m, &key, pos);
+}
+
+int midx_pair_to_pack_pos(struct multi_pack_index *m, uint32_t pack_int_id,
+			  off_t ofs, uint32_t *pos)
+{
+	struct midx_pack_key key = {
+		.pack = pack_int_id,
+		.offset = ofs,
+		.midx = m,
+	};
+	return midx_key_to_pack_pos(m, &key, pos);
 }

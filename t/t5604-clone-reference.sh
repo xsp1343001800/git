@@ -130,7 +130,7 @@ test_expect_success 'cloning with multiple references drops duplicates' '
 
 test_expect_success 'clone with reference from a tagged repository' '
 	(
-		cd A && git tag -a -m tagged HEAD
+		cd A && git tag -a -m tagged foo
 	) &&
 	git clone --reference=A A I
 '
@@ -155,10 +155,10 @@ test_expect_success 'fetch with incomplete alternates' '
 		git remote add J "file://$base_dir/J" &&
 		GIT_TRACE_PACKET=$U.K git fetch J
 	) &&
-	main_object=$(cd A && git for-each-ref --format="%(objectname)" refs/heads/main) &&
+	main_object=$(git -C A rev-parse --verify refs/heads/main) &&
 	test -s "$U.K" &&
 	! grep " want $main_object" "$U.K" &&
-	tag_object=$(cd A && git for-each-ref --format="%(objectname)" refs/tags/HEAD) &&
+	tag_object=$(git -C A rev-parse --verify refs/tags/foo) &&
 	! grep " want $tag_object" "$U.K"
 '
 
@@ -303,8 +303,6 @@ test_expect_success SYMLINKS 'setup repo with manually symlinked or unknown file
 		ln -s ../an-object $obj &&
 
 		cd ../ &&
-		find . -type f | sort >../../../T.objects-files.raw &&
-		find . -type l | sort >../../../T.objects-symlinks.raw &&
 		echo unknown_content >unknown_file
 	) &&
 	git -C T fsck &&
@@ -313,18 +311,26 @@ test_expect_success SYMLINKS 'setup repo with manually symlinked or unknown file
 
 
 test_expect_success SYMLINKS 'clone repo with symlinked or unknown files at objects/' '
-	for option in --local --no-hardlinks --shared --dissociate
+	# None of these options work when cloning locally, since T has
+	# symlinks in its `$GIT_DIR/objects` directory
+	for option in --local --no-hardlinks --dissociate
 	do
-		git clone $option T T$option || return 1 &&
-		git -C T$option fsck || return 1 &&
-		git -C T$option rev-list --all --objects >T$option.objects &&
-		test_cmp T.objects T$option.objects &&
-		(
-			cd T$option/.git/objects &&
-			find . -type f | sort >../../../T$option.objects-files.raw &&
-			find . -type l | sort >../../../T$option.objects-symlinks.raw
-		)
+		test_must_fail git clone $option T T$option 2>err || return 1 &&
+		test_grep "symlink.*exists" err || return 1
 	done &&
+
+	# But `--shared` clones should still work, even when specifying
+	# a local path *and* that repository has symlinks present in its
+	# `$GIT_DIR/objects` directory.
+	git clone --shared T T--shared &&
+	git -C T--shared fsck &&
+	git -C T--shared rev-list --all --objects >T--shared.objects &&
+	test_cmp T.objects T--shared.objects &&
+	(
+		cd T--shared/.git/objects &&
+		find . -type f | sort >../../../T--shared.objects-files.raw &&
+		find . -type l | sort >../../../T--shared.objects-symlinks.raw
+	) &&
 
 	for raw in $(ls T*.raw)
 	do
@@ -333,29 +339,25 @@ test_expect_success SYMLINKS 'clone repo with symlinked or unknown files at obje
 		sort $raw.de-sha-1 >$raw.de-sha || return 1
 	done &&
 
-	cat >expected-files <<-EOF &&
-	./Y/Z
-	./Y/Z
-	./Y/Z
-	./a-loose-dir/Z
-	./an-object
-	./info/packs
-	./pack/pack-Z.idx
-	./pack/pack-Z.pack
-	./packs/pack-Z.idx
-	./packs/pack-Z.pack
-	./unknown_file
-	EOF
-
-	for option in --local --no-hardlinks --dissociate
-	do
-		test_cmp expected-files T$option.objects-files.raw.de-sha || return 1 &&
-		test_must_be_empty T$option.objects-symlinks.raw.de-sha || return 1
-	done &&
-
 	echo ./info/alternates >expected-files &&
 	test_cmp expected-files T--shared.objects-files.raw &&
 	test_must_be_empty T--shared.objects-symlinks.raw
+'
+
+test_expect_success SYMLINKS 'clone repo with symlinked objects directory' '
+	test_when_finished "rm -fr sensitive malicious" &&
+
+	mkdir -p sensitive &&
+	echo "secret" >sensitive/file &&
+
+	git init malicious &&
+	rm -fr malicious/.git/objects &&
+	ln -s "$(pwd)/sensitive" ./malicious/.git/objects &&
+
+	test_must_fail git clone --local malicious clone 2>err &&
+
+	test_path_is_missing clone &&
+	grep "is a symlink, refusing to clone with --local" err
 '
 
 test_done

@@ -68,6 +68,10 @@ test_language_driver () {
 		echo "* diff='"$lang"'" >.gitattributes &&
 		word_diff --color-words
 	'
+	test_expect_success "diff driver '$lang' in Islandic" '
+		test_env LANG=is_IS.UTF-8 LANGUAGE=is LC_ALL="$is_IS_locale" \
+		word_diff --color-words
+	'
 }
 
 test_expect_success setup '
@@ -323,6 +327,7 @@ test_language_driver dts
 test_language_driver fortran
 test_language_driver html
 test_language_driver java
+test_language_driver kotlin
 test_language_driver matlab
 test_language_driver objc
 test_language_driver pascal

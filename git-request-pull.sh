@@ -112,7 +112,7 @@ find_matching_ref='
 	}
 '
 
-set fnord $(git ls-remote "$url" | @@PERL@@ -e "$find_matching_ref" "${remote:-HEAD}" "$headrev")
+set fnord $(git ls-remote "$url" | @PERL_PATH@ -e "$find_matching_ref" "${remote:-HEAD}" "$headrev")
 remote_sha1=$2
 ref=$3
 
@@ -153,7 +153,7 @@ for you to fetch changes up to %H:
 if test $(git cat-file -t "$head") = tag
 then
 	git cat-file tag "$head" |
-	sed -n -e '1,/^$/d' -e '/^-----BEGIN PGP /q' -e p
+	sed -n -e '1,/^$/d' -e '/^-----BEGIN \(PGP\|SSH\|SIGNED\) /q' -e p
 	echo
 	echo "----------------------------------------------------------------"
 fi &&
