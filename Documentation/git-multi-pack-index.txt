@@ -64,15 +64,24 @@ The file given at `<path>` is expected to be readable, and can contain
 duplicates. (If a given OID is given more than once, it is marked as
 preferred if at least one instance of it begins with the special `+`
 marker).
+
+	--incremental::
+		Write an incremental MIDX file containing only objects
+		and packs not present in an existing MIDX layer.
+		Migrates non-incremental MIDXs to incremental ones when
+		necessary. Incompatible with `--bitmap`.
 --
 
 verify::
 	Verify the contents of the MIDX file.
 
 expire::
-	Delete the pack-files that are tracked 	by the MIDX file, but
-	have no objects referenced by the MIDX. Rewrite the MIDX file
-	afterward to remove all references to these pack-files.
+	Delete the pack-files that are tracked by the MIDX file, but
+	have no objects referenced by the MIDX (with the exception of
+	`.keep` packs and cruft packs). Rewrite the MIDX file afterward
+	to remove all references to these pack-files.
++
+NOTE: this mode is incompatible with incremental MIDX files.
 
 repack::
 	Create a new pack-file containing objects in small pack-files
@@ -94,7 +103,8 @@ repack::
 +
 If `repack.packKeptObjects` is `false`, then any pack-files with an
 associated `.keep` file will not be selected for the batch to repack.
-
++
+NOTE: this mode is incompatible with incremental MIDX files.
 
 EXAMPLES
 --------
@@ -128,8 +138,8 @@ $ git multi-pack-index verify
 SEE ALSO
 --------
 See link:technical/multi-pack-index.html[The Multi-Pack-Index Design
-Document] and link:technical/pack-format.html[The Multi-Pack-Index
-Format] for more information on the multi-pack-index feature.
+Document] and linkgit:gitformat-pack[5] for more information on the
+multi-pack-index feature and its file format.
 
 
 GIT

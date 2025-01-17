@@ -1,6 +1,10 @@
-#include "cache.h"
+#include "git-compat-util.h"
+#include "gettext.h"
+#include "hash.h"
 #include "merge-ort.h"
 #include "merge-ort-wrappers.h"
+#include "read-cache-ll.h"
+#include "tree.h"
 
 #include "commit.h"
 
@@ -10,8 +14,8 @@ static int unclean(struct merge_options *opt, struct tree *head)
 	struct strbuf sb = STRBUF_INIT;
 
 	if (head && repo_index_has_changes(opt->repo, head, &sb)) {
-		fprintf(stderr, _("Your local changes to the following files would be overwritten by merge:\n  %s"),
-		    sb.buf);
+		error(_("Your local changes to the following files would be overwritten by merge:\n  %s"),
+		      sb.buf);
 		strbuf_release(&sb);
 		return -1;
 	}
@@ -44,7 +48,7 @@ int merge_ort_nonrecursive(struct merge_options *opt,
 int merge_ort_recursive(struct merge_options *opt,
 			struct commit *side1,
 			struct commit *side2,
-			struct commit_list *merge_bases,
+			const struct commit_list *merge_bases,
 			struct commit **result)
 {
 	struct tree *head = repo_get_commit_tree(opt->repo, side1);

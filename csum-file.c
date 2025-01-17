@@ -7,9 +7,13 @@
  * files. Useful when you write a file that you want to be
  * able to verify hasn't been messed with afterwards.
  */
-#include "cache.h"
+
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
 #include "progress.h"
 #include "csum-file.h"
+#include "hash.h"
 
 static void verify_buffer_or_die(struct hashfile *f,
 				 const void *buf,
@@ -19,7 +23,7 @@ static void verify_buffer_or_die(struct hashfile *f,
 
 	if (ret < 0)
 		die_errno("%s: sha1 file read error", f->name);
-	if (ret != count)
+	if ((size_t)ret != count)
 		die("%s: sha1 file truncated", f->name);
 	if (memcmp(buf, f->check_buffer, count))
 		die("sha1 file '%s' validation error", f->name);
@@ -45,31 +49,38 @@ void hashflush(struct hashfile *f)
 	unsigned offset = f->offset;
 
 	if (offset) {
-		the_hash_algo->update_fn(&f->ctx, f->buffer, offset);
+		if (!f->skip_hash)
+			the_hash_algo->unsafe_update_fn(&f->ctx, f->buffer, offset);
 		flush(f, f->buffer, offset);
 		f->offset = 0;
 	}
 }
 
-static void free_hashfile(struct hashfile *f)
+void free_hashfile(struct hashfile *f)
 {
 	free(f->buffer);
 	free(f->check_buffer);
 	free(f);
 }
 
-int finalize_hashfile(struct hashfile *f, unsigned char *result, unsigned int flags)
+int finalize_hashfile(struct hashfile *f, unsigned char *result,
+		      enum fsync_component component, unsigned int flags)
 {
 	int fd;
 
 	hashflush(f);
-	the_hash_algo->final_fn(f->buffer, &f->ctx);
+
+	if (f->skip_hash)
+		hashclr(f->buffer, the_repository->hash_algo);
+	else
+		the_hash_algo->unsafe_final_fn(f->buffer, &f->ctx);
+
 	if (result)
-		hashcpy(result, f->buffer);
+		hashcpy(result, f->buffer, the_repository->hash_algo);
 	if (flags & CSUM_HASH_IN_STREAM)
 		flush(f, f->buffer, the_hash_algo->rawsz);
 	if (flags & CSUM_FSYNC)
-		fsync_or_die(f->fd, f->name);
+		fsync_component_or_die(component, f->fd, f->name);
 	if (flags & CSUM_CLOSE) {
 		if (close(f->fd))
 			die_errno("%s: sha1 file error on close", f->name);
@@ -91,6 +102,15 @@ int finalize_hashfile(struct hashfile *f, unsigned char *result, unsigned int fl
 	return fd;
 }
 
+void discard_hashfile(struct hashfile *f)
+{
+	if (0 <= f->check_fd)
+		close(f->check_fd);
+	if (0 <= f->fd)
+		close(f->fd);
+	free_hashfile(f);
+}
+
 void hashwrite(struct hashfile *f, const void *buf, unsigned int count)
 {
 	while (count) {
@@ -107,7 +127,8 @@ void hashwrite(struct hashfile *f, const void *buf, unsigned int count)
 			 * the hashfile's buffer. In this block,
 			 * f->offset is necessarily zero.
 			 */
-			the_hash_algo->update_fn(&f->ctx, buf, nr);
+			if (!f->skip_hash)
+				the_hash_algo->unsafe_update_fn(&f->ctx, buf, nr);
 			flush(f, buf, nr);
 		} else {
 			/*
@@ -152,7 +173,8 @@ static struct hashfile *hashfd_internal(int fd, const char *name,
 	f->tp = tp;
 	f->name = name;
 	f->do_crc = 0;
-	the_hash_algo->init_fn(&f->ctx);
+	f->skip_hash = 0;
+	the_hash_algo->unsafe_init_fn(&f->ctx);
 
 	f->buffer_len = buffer_len;
 	f->buffer = xmalloc(buffer_len);
@@ -186,7 +208,7 @@ void hashfile_checkpoint(struct hashfile *f, struct hashfile_checkpoint *checkpo
 {
 	hashflush(f);
 	checkpoint->offset = f->total;
-	the_hash_algo->clone_fn(&checkpoint->ctx, &f->ctx);
+	the_hash_algo->unsafe_clone_fn(&checkpoint->ctx, &f->ctx);
 }
 
 int hashfile_truncate(struct hashfile *f, struct hashfile_checkpoint *checkpoint)
@@ -197,7 +219,7 @@ int hashfile_truncate(struct hashfile *f, struct hashfile_checkpoint *checkpoint
 	    lseek(f->fd, offset, SEEK_SET) != offset)
 		return -1;
 	f->total = offset;
-	f->ctx = checkpoint->ctx;
+	the_hash_algo->unsafe_clone_fn(&f->ctx, &checkpoint->ctx);
 	f->offset = 0; /* hashflush() was called in checkpoint */
 	return 0;
 }
@@ -223,9 +245,9 @@ int hashfile_checksum_valid(const unsigned char *data, size_t total_len)
 	if (total_len < the_hash_algo->rawsz)
 		return 0; /* say "too short"? */
 
-	the_hash_algo->init_fn(&ctx);
-	the_hash_algo->update_fn(&ctx, data, data_len);
-	the_hash_algo->final_fn(got, &ctx);
+	the_hash_algo->unsafe_init_fn(&ctx);
+	the_hash_algo->unsafe_update_fn(&ctx, data, data_len);
+	the_hash_algo->unsafe_final_fn(got, &ctx);
 
-	return hasheq(got, data + data_len);
+	return hasheq(got, data + data_len, the_repository->hash_algo);
 }

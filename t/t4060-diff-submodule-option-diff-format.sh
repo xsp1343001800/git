@@ -12,12 +12,17 @@ This test tries to verify the sanity of --submodule=diff option of git diff.
 
 . ./test-lib.sh
 
-# Tested non-UTF-8 encoding
-test_encoding="ISO8859-1"
-
-# String "added" in German (translated with Google Translate), encoded in UTF-8,
-# used in sample commit log messages in add_file() function below.
-added=$(printf "hinzugef\303\274gt")
+# Test non-UTF-8 encoding in case iconv is available.
+if test_have_prereq ICONV
+then
+	test_encoding="ISO8859-1"
+	# String "added" in German (translated with Google Translate), encoded in UTF-8,
+	# used in sample commit log messages in add_file() function below.
+	added=$(printf "hinzugef\303\274gt")
+else
+	test_encoding="UTF-8"
+	added="added"
+fi
 
 add_file () {
 	(
@@ -840,7 +845,7 @@ rm sm2
 mv sm2-bak sm2
 
 test_expect_success 'setup nested submodule' '
-	git -C sm2 submodule add ../sm2 nested &&
+	git -c protocol.file.allow=always -C sm2 submodule add ../sm2 nested &&
 	git -C sm2 commit -a -m "nested sub" &&
 	head10=$(git -C sm2 rev-parse --short --verify HEAD)
 '

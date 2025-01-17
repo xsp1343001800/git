@@ -1,10 +1,21 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "gettext.h"
+#include "hash.h"
+#include "mem-pool.h"
+#include "read-cache-ll.h"
 #include "split-index.h"
+#include "strbuf.h"
 #include "ewah/ewok.h"
 
 struct split_index *init_split_index(struct index_state *istate)
 {
 	if (!istate->split_index) {
+		if (istate->sparse_index)
+			die(_("cannot use split index with a sparse index"));
+
 		CALLOC_ARRAY(istate->split_index, 1);
 		istate->split_index->refcount = 1;
 	}
@@ -21,7 +32,7 @@ int read_link_extension(struct index_state *istate,
 	if (sz < the_hash_algo->rawsz)
 		return error("corrupt link extension (too short)");
 	si = init_split_index(istate);
-	oidread(&si->base_oid, data);
+	oidread(&si->base_oid, data, the_repository->hash_algo);
 	data += the_hash_algo->rawsz;
 	sz -= the_hash_algo->rawsz;
 	if (!sz)
@@ -87,7 +98,12 @@ void move_cache_to_base_index(struct index_state *istate)
 		mem_pool_combine(istate->ce_mem_pool, istate->split_index->base->ce_mem_pool);
 	}
 
-	CALLOC_ARRAY(si->base, 1);
+	if (si->base)
+		release_index(si->base);
+	else
+		ALLOC_ARRAY(si->base, 1);
+
+	index_state_init(si->base, istate->repo);
 	si->base->version = istate->version;
 	/* zero timestamp disables racy test in ce_write_index() */
 	si->base->timestamp = istate->timestamp;

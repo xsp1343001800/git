@@ -1,43 +1,44 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
+#include "environment.h"
+#include "gettext.h"
+#include "hash.h"
+#include "hex.h"
 #include "repository.h"
 #include "refs.h"
-#include "remote.h"
 #include "strvec.h"
 #include "ls-refs.h"
 #include "pkt-line.h"
 #include "config.h"
+#include "string-list.h"
 
-static int config_read;
-static int advertise_unborn;
-static int allow_unborn;
-
-static void ensure_config_read(void)
+static enum {
+	UNBORN_IGNORE = 0,
+	UNBORN_ALLOW,
+	UNBORN_ADVERTISE /* implies ALLOW */
+} unborn_config(struct repository *r)
 {
 	const char *str = NULL;
 
-	if (config_read)
-		return;
-
-	if (repo_config_get_string_tmp(the_repository, "lsrefs.unborn", &str)) {
+	if (repo_config_get_string_tmp(r, "lsrefs.unborn", &str)) {
 		/*
 		 * If there is no such config, advertise and allow it by
 		 * default.
 		 */
-		advertise_unborn = 1;
-		allow_unborn = 1;
+		return UNBORN_ADVERTISE;
 	} else {
 		if (!strcmp(str, "advertise")) {
-			advertise_unborn = 1;
-			allow_unborn = 1;
+			return UNBORN_ADVERTISE;
 		} else if (!strcmp(str, "allow")) {
-			allow_unborn = 1;
+			return UNBORN_ALLOW;
 		} else if (!strcmp(str, "ignore")) {
-			/* do nothing */
+			return UNBORN_IGNORE;
 		} else {
-			die(_("invalid value '%s' for lsrefs.unborn"), str);
+			die(_("invalid value for '%s': '%s'"),
+			    "lsrefs.unborn", str);
 		}
 	}
-	config_read = 1;
 }
 
 /*
@@ -52,12 +53,10 @@ static void ensure_config_read(void)
  */
 static int ref_match(const struct strvec *prefixes, const char *refname)
 {
-	int i;
-
 	if (!prefixes->nr)
 		return 1; /* no restriction */
 
-	for (i = 0; i < prefixes->nr; i++) {
+	for (size_t i = 0; i < prefixes->nr; i++) {
 		const char *prefix = prefixes->v[i];
 
 		if (starts_with(refname, prefix))
@@ -72,10 +71,11 @@ struct ls_refs_data {
 	unsigned symrefs;
 	struct strvec prefixes;
 	struct strbuf buf;
+	struct strvec hidden_refs;
 	unsigned unborn : 1;
 };
 
-static int send_ref(const char *refname, const struct object_id *oid,
+static int send_ref(const char *refname, const char *referent UNUSED, const struct object_id *oid,
 		    int flag, void *cb_data)
 {
 	struct ls_refs_data *data = cb_data;
@@ -83,7 +83,7 @@ static int send_ref(const char *refname, const struct object_id *oid,
 
 	strbuf_reset(&data->buf);
 
-	if (ref_is_hidden(refname_nons, refname))
+	if (ref_is_hidden(refname_nons, refname, &data->hidden_refs))
 		return 0;
 
 	if (!ref_match(&data->prefixes, refname_nons))
@@ -95,9 +95,11 @@ static int send_ref(const char *refname, const struct object_id *oid,
 		strbuf_addf(&data->buf, "unborn %s", refname_nons);
 	if (data->symrefs && flag & REF_ISSYMREF) {
 		struct object_id unused;
-		const char *symref_target = resolve_ref_unsafe(refname, 0,
-							       &unused,
-							       &flag);
+		const char *symref_target = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
+								    refname,
+								    0,
+								    &unused,
+								    &flag);
 
 		if (!symref_target)
 			die("'%s' is a symref but it is not?", refname);
@@ -108,7 +110,7 @@ static int send_ref(const char *refname, const struct object_id *oid,
 
 	if (data->peel && oid) {
 		struct object_id peeled;
-		if (!peel_iterated_oid(oid, &peeled))
+		if (!peel_iterated_oid(the_repository, oid, &peeled))
 			strbuf_addf(&data->buf, " peeled:%s", oid_to_hex(&peeled));
 	}
 
@@ -126,23 +128,26 @@ static void send_possibly_unborn_head(struct ls_refs_data *data)
 	int oid_is_null;
 
 	strbuf_addf(&namespaced, "%sHEAD", get_git_namespace());
-	if (!resolve_ref_unsafe(namespaced.buf, 0, &oid, &flag))
+	if (!refs_resolve_ref_unsafe(get_main_ref_store(the_repository), namespaced.buf, 0, &oid, &flag))
 		return; /* bad ref */
 	oid_is_null = is_null_oid(&oid);
 	if (!oid_is_null ||
 	    (data->unborn && data->symrefs && (flag & REF_ISSYMREF)))
-		send_ref(namespaced.buf, oid_is_null ? NULL : &oid, flag, data);
+		send_ref(namespaced.buf, NULL, oid_is_null ? NULL : &oid, flag, data);
 	strbuf_release(&namespaced);
 }
 
-static int ls_refs_config(const char *var, const char *value, void *data)
+static int ls_refs_config(const char *var, const char *value,
+			  const struct config_context *ctx UNUSED,
+			  void *cb_data)
 {
+	struct ls_refs_data *data = cb_data;
 	/*
 	 * We only serve fetches over v2 for now, so respect only "uploadpack"
 	 * config. This may need to eventually be expanded to "receive", but we
 	 * don't yet know how that information will be passed to ls-refs.
 	 */
-	return parse_hide_refs_config(var, value, "uploadpack");
+	return parse_hide_refs_config(var, value, "uploadpack", &data->hidden_refs);
 }
 
 int ls_refs(struct repository *r, struct packet_reader *request)
@@ -152,9 +157,9 @@ int ls_refs(struct repository *r, struct packet_reader *request)
 	memset(&data, 0, sizeof(data));
 	strvec_init(&data.prefixes);
 	strbuf_init(&data.buf, 0);
+	strvec_init(&data.hidden_refs);
 
-	ensure_config_read();
-	git_config(ls_refs_config, NULL);
+	git_config(ls_refs_config, &data);
 
 	while (packet_reader_read(request) == PACKET_READ_NORMAL) {
 		const char *arg = request->line;
@@ -169,7 +174,7 @@ int ls_refs(struct repository *r, struct packet_reader *request)
 				strvec_push(&data.prefixes, out);
 		}
 		else if (!strcmp("unborn", arg))
-			data.unborn = allow_unborn;
+			data.unborn = !!unborn_config(r);
 		else
 			die(_("unexpected line: '%s'"), arg);
 	}
@@ -188,21 +193,21 @@ int ls_refs(struct repository *r, struct packet_reader *request)
 	send_possibly_unborn_head(&data);
 	if (!data.prefixes.nr)
 		strvec_push(&data.prefixes, "");
-	for_each_fullref_in_prefixes(get_git_namespace(), data.prefixes.v,
-				     send_ref, &data);
+	refs_for_each_fullref_in_prefixes(get_main_ref_store(r),
+					  get_git_namespace(), data.prefixes.v,
+					  hidden_refs_to_excludes(&data.hidden_refs),
+					  send_ref, &data);
 	packet_fflush(stdout);
 	strvec_clear(&data.prefixes);
 	strbuf_release(&data.buf);
+	strvec_clear(&data.hidden_refs);
 	return 0;
 }
 
 int ls_refs_advertise(struct repository *r, struct strbuf *value)
 {
-	if (value) {
-		ensure_config_read();
-		if (advertise_unborn)
-			strbuf_addstr(value, "unborn");
-	}
+	if (value && unborn_config(r) == UNBORN_ADVERTISE)
+		strbuf_addstr(value, "unborn");
 
 	return 1;
 }

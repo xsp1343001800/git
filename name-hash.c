@@ -5,8 +5,18 @@
  *
  * Copyright (C) 2008 Linus Torvalds
  */
-#include "cache.h"
+
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "environment.h"
+#include "gettext.h"
+#include "name-hash.h"
+#include "object.h"
+#include "read-cache-ll.h"
 #include "thread-utils.h"
+#include "trace.h"
 #include "trace2.h"
 #include "sparse-index.h"
 
@@ -18,7 +28,7 @@ struct dir_entry {
 	char name[FLEX_ARRAY];
 };
 
-static int dir_entry_cmp(const void *unused_cmp_data,
+static int dir_entry_cmp(const void *cmp_data UNUSED,
 			 const struct hashmap_entry *eptr,
 			 const struct hashmap_entry *entry_or_key,
 			 const void *keydata)
@@ -120,7 +130,7 @@ static void hash_index_entry(struct index_state *istate, struct cache_entry *ce)
 		add_dir_entry(istate, ce);
 }
 
-static int cache_entry_cmp(const void *unused_cmp_data,
+static int cache_entry_cmp(const void *cmp_data UNUSED,
 			   const struct hashmap_entry *eptr,
 			   const struct hashmap_entry *entry_or_key,
 			   const void *remove)
@@ -679,13 +689,20 @@ static int same_name(const struct cache_entry *ce, const char *name, int namelen
 	return slow_same_name(name, namelen, ce->name, len);
 }
 
-int index_dir_exists(struct index_state *istate, const char *name, int namelen)
+int index_dir_find(struct index_state *istate, const char *name, int namelen,
+		   struct strbuf *canonical_path)
 {
 	struct dir_entry *dir;
 
 	lazy_init_name_hash(istate);
 	expand_to_path(istate, name, namelen, 0);
 	dir = find_dir_entry(istate, name, namelen);
+
+	if (canonical_path && dir && dir->nr) {
+		strbuf_reset(canonical_path);
+		strbuf_add(canonical_path, dir->name, dir->namelen);
+	}
+
 	return dir && dir->nr;
 }
 

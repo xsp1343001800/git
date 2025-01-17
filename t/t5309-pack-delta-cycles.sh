@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='test index-pack handling of delta cycles in packfiles'
+
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-pack.sh
 

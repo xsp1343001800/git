@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='rev-list with .keep packs'
+
 . ./test-lib.sh
 
 test_expect_success 'setup' '

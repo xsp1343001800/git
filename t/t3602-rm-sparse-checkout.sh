@@ -20,7 +20,7 @@ test_expect_success 'setup' "
 	hint: If you intend to update such entries, try one of the following:
 	hint: * Use the --sparse option.
 	hint: * Disable or modify the sparsity rules.
-	hint: Disable this message with \"git config advice.updateSparsePath false\"
+	hint: Disable this message with \"git config set advice.updateSparsePath false\"
 	EOF
 
 	echo b | cat sparse_error_header - >sparse_entry_b_error &&
@@ -30,7 +30,7 @@ test_expect_success 'setup' "
 for opt in "" -f --dry-run
 do
 	test_expect_success "rm${opt:+ $opt} does not remove sparse entries" '
-		git sparse-checkout set a &&
+		git sparse-checkout set --no-cone a &&
 		test_must_fail git rm $opt b 2>stderr &&
 		test_cmp b_error_and_hint stderr &&
 		git ls-files --error-unmatch b
@@ -118,7 +118,7 @@ test_expect_success 'can remove files from non-sparse dir' '
 	test_commit w/f &&
 	test_commit x/y/f &&
 
-	git sparse-checkout set w !/x y/ &&
+	git sparse-checkout set --no-cone w !/x y/ &&
 	git rm w/f.t x/y/f.t 2>stderr &&
 	test_must_be_empty stderr
 '
@@ -128,7 +128,7 @@ test_expect_success 'refuse to remove non-skip-worktree file from sparse dir' '
 	git sparse-checkout disable &&
 	mkdir -p x/y/z &&
 	test_commit x/y/z/f &&
-	git sparse-checkout set !/x y/ !x/y/z &&
+	git sparse-checkout set --no-cone !/x y/ !x/y/z &&
 
 	git update-index --no-skip-worktree x/y/z/f.t &&
 	test_must_fail git rm x/y/z/f.t 2>stderr &&

@@ -1,4 +1,8 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "gettext.h"
 #include "config.h"
 #include "commit.h"
 #include "color.h"
@@ -73,10 +77,7 @@ static void graph_show_line_prefix(const struct diff_options *diffopt)
 	if (!diffopt || !diffopt->line_prefix)
 		return;
 
-	fwrite(diffopt->line_prefix,
-	       sizeof(char),
-	       diffopt->line_prefix_length,
-	       diffopt->file);
+	fputs(diffopt->line_prefix, diffopt->file);
 }
 
 static const char **column_colors;
@@ -309,22 +310,28 @@ struct git_graph {
 	 * stored as an index into the array column_colors.
 	 */
 	unsigned short default_column_color;
+
+	/*
+	 * Scratch buffer for generating prefixes to be used with
+	 * diff_output_prefix_callback().
+	 */
+	struct strbuf prefix_buf;
 };
 
-static struct strbuf *diff_output_prefix_callback(struct diff_options *opt, void *data)
+static const char *diff_output_prefix_callback(struct diff_options *opt, void *data)
 {
 	struct git_graph *graph = data;
-	static struct strbuf msgbuf = STRBUF_INIT;
 
 	assert(opt);
 
-	strbuf_reset(&msgbuf);
+	if (!graph)
+		return opt->line_prefix;
+
+	strbuf_reset(&graph->prefix_buf);
 	if (opt->line_prefix)
-		strbuf_add(&msgbuf, opt->line_prefix,
-			   opt->line_prefix_length);
-	if (graph)
-		graph_padding_line(graph, &msgbuf);
-	return &msgbuf;
+		strbuf_addstr(&graph->prefix_buf, opt->line_prefix);
+	graph_padding_line(graph, &graph->prefix_buf);
+	return graph->prefix_buf.buf;
 }
 
 static const struct diff_options *default_diffopt;
@@ -337,7 +344,6 @@ void graph_setup_line_prefix(struct diff_options *diffopt)
 	if (diffopt && !diffopt->output_prefix)
 		diffopt->output_prefix = diff_output_prefix_callback;
 }
-
 
 struct git_graph *graph_init(struct rev_info *opt)
 {
@@ -395,10 +401,24 @@ struct git_graph *graph_init(struct rev_info *opt)
 	 * The diff output prefix callback, with this we can make
 	 * all the diff output to align with the graph lines.
 	 */
+	strbuf_init(&graph->prefix_buf, 0);
 	opt->diffopt.output_prefix = diff_output_prefix_callback;
 	opt->diffopt.output_prefix_data = graph;
 
 	return graph;
+}
+
+void graph_clear(struct git_graph *graph)
+{
+	if (!graph)
+		return;
+
+	free(graph->columns);
+	free(graph->new_columns);
+	free(graph->mapping);
+	free(graph->old_mapping);
+	strbuf_release(&graph->prefix_buf);
+	free(graph);
 }
 
 static void graph_update_state(struct git_graph *graph, enum graph_state s)

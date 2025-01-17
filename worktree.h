@@ -1,12 +1,13 @@
 #ifndef WORKTREE_H
 #define WORKTREE_H
 
-#include "cache.h"
 #include "refs.h"
 
 struct strbuf;
 
 struct worktree {
+	/* The repository this worktree belongs to. */
+	struct repository *repo;
 	char *path;
 	char *id;
 	char *head_ref;		/* NULL if HEAD is broken or detached */
@@ -59,6 +60,13 @@ struct worktree *find_worktree(struct worktree **list,
 			       const char *arg);
 
 /*
+ * Look up the worktree corresponding to `id`, or NULL of no such worktree
+ * exists.
+ */
+struct worktree *get_linked_worktree(const char *id,
+				     int skip_reading_head);
+
+/*
  * Return the worktree corresponding to `path`, or NULL if no such worktree
  * exists.
  */
@@ -109,8 +117,8 @@ int validate_worktree(const struct worktree *wt,
 /*
  * Update worktrees/xxx/gitdir with the new path.
  */
-void update_worktree_location(struct worktree *wt,
-			      const char *path_);
+void update_worktree_location(struct worktree *wt, const char *path_,
+			      int use_relative_paths);
 
 typedef void (* worktree_repair_fn)(int iserr, const char *path,
 				    const char *msg, void *cb_data);
@@ -121,7 +129,17 @@ typedef void (* worktree_repair_fn)(int iserr, const char *path,
  * function, if non-NULL, is called with the path of the worktree and a
  * description of the repair or error, along with the callback user-data.
  */
-void repair_worktrees(worktree_repair_fn, void *cb_data);
+void repair_worktrees(worktree_repair_fn, void *cb_data, int use_relative_paths);
+
+/*
+ * Repair the linked worktrees after the gitdir has been moved.
+ */
+void repair_worktrees_after_gitdir_move(const char *old_path);
+
+/*
+ * Repair the linked worktree after the gitdir has been moved.
+ */
+void repair_worktree_after_gitdir_move(struct worktree *wt, const char *old_path);
 
 /*
  * Repair administrative files corresponding to the worktree at the given path.
@@ -133,7 +151,13 @@ void repair_worktrees(worktree_repair_fn, void *cb_data);
  * worktree and a description of the repair or error, along with the callback
  * user-data.
  */
-void repair_worktree_at_path(const char *, worktree_repair_fn, void *cb_data);
+void repair_worktree_at_path(const char *, worktree_repair_fn,
+			     void *cb_data, int use_relative_paths);
+
+/*
+ * Free up the memory for a worktree.
+ */
+void free_worktree(struct worktree *);
 
 /*
  * Free up the memory for worktree(s)
@@ -143,10 +167,17 @@ void free_worktrees(struct worktree **);
 /*
  * Check if a per-worktree symref points to a ref in the main worktree
  * or any linked worktree, and return the worktree that holds the ref,
- * or NULL otherwise. The result may be destroyed by the next call.
+ * or NULL otherwise.
  */
-const struct worktree *find_shared_symref(const char *symref,
+const struct worktree *find_shared_symref(struct worktree **worktrees,
+					  const char *symref,
 					  const char *target);
+
+/*
+ * Returns true if a symref points to a ref in a worktree.
+ */
+int is_shared_symref(const struct worktree *wt,
+		     const char *symref, const char *target);
 
 /*
  * Similar to head_ref() for all HEADs _except_ one from the current
@@ -158,28 +189,44 @@ int is_worktree_being_rebased(const struct worktree *wt, const char *target);
 int is_worktree_being_bisected(const struct worktree *wt, const char *target);
 
 /*
- * Similar to git_path() but can produce paths for a specified
- * worktree instead of current one
- */
-const char *worktree_git_path(const struct worktree *wt,
-			      const char *fmt, ...)
-	__attribute__((format (printf, 2, 3)));
-
-/*
- * Parse a worktree ref (i.e. with prefix main-worktree/ or
- * worktrees/) and return the position of the worktree's name and
- * length (or NULL and zero if it's main worktree), and ref.
- *
- * All name, name_length and ref arguments could be NULL.
- */
-int parse_worktree_ref(const char *worktree_ref, const char **name,
-		       int *name_length, const char **ref);
-
-/*
  * Return a refname suitable for access from the current ref store.
  */
 void strbuf_worktree_ref(const struct worktree *wt,
 			 struct strbuf *sb,
 			 const char *refname);
+
+/**
+ * Enable worktree config for the first time. This will make the following
+ * adjustments:
+ *
+ * 1. Add extensions.worktreeConfig=true in the common config file.
+ *
+ * 2. If the common config file has a core.worktree value, then that value
+ *    is moved to the main worktree's config.worktree file.
+ *
+ * 3. If the common config file has a core.bare enabled, then that value
+ *    is moved to the main worktree's config.worktree file.
+ *
+ * If extensions.worktreeConfig is already true, then this method
+ * terminates early without any of the above steps. The existing config
+ * arrangement is assumed to be intentional.
+ *
+ * Returns 0 on success. Reports an error message and returns non-zero
+ * if any of these steps fail.
+ */
+int init_worktree_config(struct repository *r);
+
+/**
+ * Write the .git file and gitdir file that links the worktree to the repository.
+ *
+ * The `dotgit` parameter is the path to the worktree's .git file, and `gitdir`
+ * is the path to the repository's `gitdir` file.
+ *
+ * Example
+ *  dotgit: "/path/to/foo/.git"
+ *  gitdir: "/path/to/repo/worktrees/foo/gitdir"
+ */
+void write_worktree_linking_files(struct strbuf dotgit, struct strbuf gitdir,
+				  int use_relative_paths);
 
 #endif

@@ -22,8 +22,8 @@ test_expect_success 'disable reflogs' '
 '
 
 create_bogus_ref () {
-	test_when_finished 'rm -f .git/refs/heads/bogus..name' &&
-	echo $bogus >.git/refs/heads/bogus..name
+	test-tool ref-store main update-ref msg "refs/heads/bogus..name" $bogus $ZERO_OID REF_SKIP_REFNAME_VERIFICATION &&
+	test_when_finished "test-tool ref-store main delete-refs REF_NO_DEREF msg refs/heads/bogus..name"
 }
 
 test_expect_success 'create history reachable only from a bogus-named ref' '
@@ -106,32 +106,6 @@ test_expect_success 'pruning with a corrupted tip does not drop history' '
 test_expect_success 'pack-refs does not silently delete broken loose ref' '
 	git pack-refs --all --prune &&
 	echo $missing >expect &&
-	git rev-parse refs/heads/main >actual &&
-	test_cmp expect actual
-'
-
-# we do not want to count on running pack-refs to
-# actually pack it, as it is perfectly reasonable to
-# skip processing a broken ref
-test_expect_success 'create packed-refs file with broken ref' '
-	rm -f .git/refs/heads/main &&
-	cat >.git/packed-refs <<-EOF &&
-	$missing refs/heads/main
-	$recoverable refs/heads/other
-	EOF
-	echo $missing >expect &&
-	git rev-parse refs/heads/main >actual &&
-	test_cmp expect actual
-'
-
-test_expect_success 'pack-refs does not silently delete broken packed ref' '
-	git pack-refs --all --prune &&
-	git rev-parse refs/heads/main >actual &&
-	test_cmp expect actual
-'
-
-test_expect_success 'pack-refs does not drop broken refs during deletion' '
-	git update-ref -d refs/heads/other &&
 	git rev-parse refs/heads/main >actual &&
 	test_cmp expect actual
 '

@@ -119,6 +119,7 @@ test_expect_success 'push options and submodules' '
 	test_commit -C parent one &&
 	git -C parent push --mirror up &&
 
+	test_config_global protocol.file.allow always &&
 	git -C parent submodule add ../upstream workbench &&
 	git -C parent/workbench remote add up ../../upstream &&
 	git -C parent commit -m "add submodule" &&
@@ -251,7 +252,7 @@ test_expect_success 'push option denied properly by http server' '
 	mk_http_pair false &&
 	test_commit -C test_http_clone one &&
 	test_must_fail git -C test_http_clone push --push-option=asdf origin main 2>actual &&
-	test_i18ngrep "the receiving end does not support push options" actual &&
+	test_grep "the receiving end does not support push options" actual &&
 	git -C test_http_clone push origin main
 '
 

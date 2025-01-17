@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='reflog walk shows repeated commits again'
+
 . ./test-lib.sh
 
 test_expect_success 'setup commits' '

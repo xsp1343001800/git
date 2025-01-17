@@ -6,62 +6,57 @@
  * This handles basic git object files - packing, unpacking,
  * creation etc.
  */
-#include "cache.h"
+
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "abspath.h"
 #include "config.h"
+#include "convert.h"
+#include "environment.h"
+#include "gettext.h"
+#include "hex.h"
 #include "string-list.h"
 #include "lockfile.h"
-#include "delta.h"
 #include "pack.h"
-#include "blob.h"
 #include "commit.h"
 #include "run-command.h"
-#include "tag.h"
-#include "tree.h"
-#include "tree-walk.h"
 #include "refs.h"
-#include "pack-revindex.h"
-#include "hash-lookup.h"
 #include "bulk-checkin.h"
 #include "repository.h"
 #include "replace-object.h"
 #include "streaming.h"
 #include "dir.h"
 #include "list.h"
-#include "mergesort.h"
 #include "quote.h"
 #include "packfile.h"
+#include "object-file.h"
 #include "object-store.h"
+#include "oidtree.h"
+#include "path.h"
 #include "promisor-remote.h"
+#include "setup.h"
 #include "submodule.h"
+#include "fsck.h"
+#include "loose.h"
+#include "object-file-convert.h"
 
 /* The maximum size for an object header. */
 #define MAX_HEADER_LEN 32
 
-
-#define EMPTY_TREE_SHA1_BIN_LITERAL \
-	 "\x4b\x82\x5d\xc6\x42\xcb\x6e\xb9\xa0\x60" \
-	 "\xe5\x4b\xf8\xd6\x92\x88\xfb\xee\x49\x04"
-#define EMPTY_TREE_SHA256_BIN_LITERAL \
-	"\x6e\xf1\x9b\x41\x22\x5c\x53\x69\xf1\xc1" \
-	"\x04\xd4\x5d\x8d\x85\xef\xa9\xb0\x57\xb5" \
-	"\x3b\x14\xb4\xb9\xb9\x39\xdd\x74\xde\xcc" \
-	"\x53\x21"
-
-#define EMPTY_BLOB_SHA1_BIN_LITERAL \
-	"\xe6\x9d\xe2\x9b\xb2\xd1\xd6\x43\x4b\x8b" \
-	"\x29\xae\x77\x5a\xd8\xc2\xe4\x8c\x53\x91"
-#define EMPTY_BLOB_SHA256_BIN_LITERAL \
-	"\x47\x3a\x0f\x4c\x3b\xe8\xa9\x36\x81\xa2" \
-	"\x67\xe3\xb1\xe9\xa7\xdc\xda\x11\x85\x43" \
-	"\x6f\xe1\x41\xf7\x74\x91\x20\xa3\x03\x72" \
-	"\x18\x13"
-
 static const struct object_id empty_tree_oid = {
-	.hash = EMPTY_TREE_SHA1_BIN_LITERAL,
+	.hash = {
+		0x4b, 0x82, 0x5d, 0xc6, 0x42, 0xcb, 0x6e, 0xb9, 0xa0, 0x60,
+		0xe5, 0x4b, 0xf8, 0xd6, 0x92, 0x88, 0xfb, 0xee, 0x49, 0x04
+	},
 	.algo = GIT_HASH_SHA1,
 };
 static const struct object_id empty_blob_oid = {
-	.hash = EMPTY_BLOB_SHA1_BIN_LITERAL,
+	.hash = {
+		0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b,
+		0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91
+	},
 	.algo = GIT_HASH_SHA1,
 };
 static const struct object_id null_oid_sha1 = {
@@ -69,11 +64,21 @@ static const struct object_id null_oid_sha1 = {
 	.algo = GIT_HASH_SHA1,
 };
 static const struct object_id empty_tree_oid_sha256 = {
-	.hash = EMPTY_TREE_SHA256_BIN_LITERAL,
+	.hash = {
+		0x6e, 0xf1, 0x9b, 0x41, 0x22, 0x5c, 0x53, 0x69, 0xf1, 0xc1,
+		0x04, 0xd4, 0x5d, 0x8d, 0x85, 0xef, 0xa9, 0xb0, 0x57, 0xb5,
+		0x3b, 0x14, 0xb4, 0xb9, 0xb9, 0x39, 0xdd, 0x74, 0xde, 0xcc,
+		0x53, 0x21
+	},
 	.algo = GIT_HASH_SHA256,
 };
 static const struct object_id empty_blob_oid_sha256 = {
-	.hash = EMPTY_BLOB_SHA256_BIN_LITERAL,
+	.hash = {
+		0x47, 0x3a, 0x0f, 0x4c, 0x3b, 0xe8, 0xa9, 0x36, 0x81, 0xa2,
+		0x67, 0xe3, 0xb1, 0xe9, 0xa7, 0xdc, 0xda, 0x11, 0x85, 0x43,
+		0x6f, 0xe1, 0x41, 0xf7, 0x74, 0x91, 0x20, 0xa3, 0x03, 0x72,
+		0x18, 0x13
+	},
 	.algo = GIT_HASH_SHA256,
 };
 static const struct object_id null_oid_sha256 = {
@@ -108,6 +113,33 @@ static void git_hash_sha1_final_oid(struct object_id *oid, git_hash_ctx *ctx)
 	oid->algo = GIT_HASH_SHA1;
 }
 
+static void git_hash_sha1_init_unsafe(git_hash_ctx *ctx)
+{
+	git_SHA1_Init_unsafe(&ctx->sha1_unsafe);
+}
+
+static void git_hash_sha1_clone_unsafe(git_hash_ctx *dst, const git_hash_ctx *src)
+{
+	git_SHA1_Clone_unsafe(&dst->sha1_unsafe, &src->sha1_unsafe);
+}
+
+static void git_hash_sha1_update_unsafe(git_hash_ctx *ctx, const void *data,
+				      size_t len)
+{
+	git_SHA1_Update_unsafe(&ctx->sha1_unsafe, data, len);
+}
+
+static void git_hash_sha1_final_unsafe(unsigned char *hash, git_hash_ctx *ctx)
+{
+	git_SHA1_Final_unsafe(hash, &ctx->sha1_unsafe);
+}
+
+static void git_hash_sha1_final_oid_unsafe(struct object_id *oid, git_hash_ctx *ctx)
+{
+	git_SHA1_Final_unsafe(oid->hash, &ctx->sha1_unsafe);
+	memset(oid->hash + GIT_SHA1_RAWSZ, 0, GIT_MAX_RAWSZ - GIT_SHA1_RAWSZ);
+	oid->algo = GIT_HASH_SHA1;
+}
 
 static void git_hash_sha256_init(git_hash_ctx *ctx)
 {
@@ -140,79 +172,96 @@ static void git_hash_sha256_final_oid(struct object_id *oid, git_hash_ctx *ctx)
 	oid->algo = GIT_HASH_SHA256;
 }
 
-static void git_hash_unknown_init(git_hash_ctx *ctx)
+static void git_hash_unknown_init(git_hash_ctx *ctx UNUSED)
 {
 	BUG("trying to init unknown hash");
 }
 
-static void git_hash_unknown_clone(git_hash_ctx *dst, const git_hash_ctx *src)
+static void git_hash_unknown_clone(git_hash_ctx *dst UNUSED,
+				   const git_hash_ctx *src UNUSED)
 {
 	BUG("trying to clone unknown hash");
 }
 
-static void git_hash_unknown_update(git_hash_ctx *ctx, const void *data, size_t len)
+static void git_hash_unknown_update(git_hash_ctx *ctx UNUSED,
+				    const void *data UNUSED,
+				    size_t len UNUSED)
 {
 	BUG("trying to update unknown hash");
 }
 
-static void git_hash_unknown_final(unsigned char *hash, git_hash_ctx *ctx)
+static void git_hash_unknown_final(unsigned char *hash UNUSED,
+				   git_hash_ctx *ctx UNUSED)
 {
 	BUG("trying to finalize unknown hash");
 }
 
-static void git_hash_unknown_final_oid(struct object_id *oid, git_hash_ctx *ctx)
+static void git_hash_unknown_final_oid(struct object_id *oid UNUSED,
+				       git_hash_ctx *ctx UNUSED)
 {
 	BUG("trying to finalize unknown hash");
 }
-
 
 const struct git_hash_algo hash_algos[GIT_HASH_NALGOS] = {
 	{
-		NULL,
-		0x00000000,
-		0,
-		0,
-		0,
-		git_hash_unknown_init,
-		git_hash_unknown_clone,
-		git_hash_unknown_update,
-		git_hash_unknown_final,
-		git_hash_unknown_final_oid,
-		NULL,
-		NULL,
-		NULL,
+		.name = NULL,
+		.format_id = 0x00000000,
+		.rawsz = 0,
+		.hexsz = 0,
+		.blksz = 0,
+		.init_fn = git_hash_unknown_init,
+		.clone_fn = git_hash_unknown_clone,
+		.update_fn = git_hash_unknown_update,
+		.final_fn = git_hash_unknown_final,
+		.final_oid_fn = git_hash_unknown_final_oid,
+		.unsafe_init_fn = git_hash_unknown_init,
+		.unsafe_clone_fn = git_hash_unknown_clone,
+		.unsafe_update_fn = git_hash_unknown_update,
+		.unsafe_final_fn = git_hash_unknown_final,
+		.unsafe_final_oid_fn = git_hash_unknown_final_oid,
+		.empty_tree = NULL,
+		.empty_blob = NULL,
+		.null_oid = NULL,
 	},
 	{
-		"sha1",
-		/* "sha1", big-endian */
-		0x73686131,
-		GIT_SHA1_RAWSZ,
-		GIT_SHA1_HEXSZ,
-		GIT_SHA1_BLKSZ,
-		git_hash_sha1_init,
-		git_hash_sha1_clone,
-		git_hash_sha1_update,
-		git_hash_sha1_final,
-		git_hash_sha1_final_oid,
-		&empty_tree_oid,
-		&empty_blob_oid,
-		&null_oid_sha1,
+		.name = "sha1",
+		.format_id = GIT_SHA1_FORMAT_ID,
+		.rawsz = GIT_SHA1_RAWSZ,
+		.hexsz = GIT_SHA1_HEXSZ,
+		.blksz = GIT_SHA1_BLKSZ,
+		.init_fn = git_hash_sha1_init,
+		.clone_fn = git_hash_sha1_clone,
+		.update_fn = git_hash_sha1_update,
+		.final_fn = git_hash_sha1_final,
+		.final_oid_fn = git_hash_sha1_final_oid,
+		.unsafe_init_fn = git_hash_sha1_init_unsafe,
+		.unsafe_clone_fn = git_hash_sha1_clone_unsafe,
+		.unsafe_update_fn = git_hash_sha1_update_unsafe,
+		.unsafe_final_fn = git_hash_sha1_final_unsafe,
+		.unsafe_final_oid_fn = git_hash_sha1_final_oid_unsafe,
+		.empty_tree = &empty_tree_oid,
+		.empty_blob = &empty_blob_oid,
+		.null_oid = &null_oid_sha1,
 	},
 	{
-		"sha256",
-		/* "s256", big-endian */
-		0x73323536,
-		GIT_SHA256_RAWSZ,
-		GIT_SHA256_HEXSZ,
-		GIT_SHA256_BLKSZ,
-		git_hash_sha256_init,
-		git_hash_sha256_clone,
-		git_hash_sha256_update,
-		git_hash_sha256_final,
-		git_hash_sha256_final_oid,
-		&empty_tree_oid_sha256,
-		&empty_blob_oid_sha256,
-		&null_oid_sha256,
+		.name = "sha256",
+		.format_id = GIT_SHA256_FORMAT_ID,
+		.rawsz = GIT_SHA256_RAWSZ,
+		.hexsz = GIT_SHA256_HEXSZ,
+		.blksz = GIT_SHA256_BLKSZ,
+		.init_fn = git_hash_sha256_init,
+		.clone_fn = git_hash_sha256_clone,
+		.update_fn = git_hash_sha256_update,
+		.final_fn = git_hash_sha256_final,
+		.final_oid_fn = git_hash_sha256_final_oid,
+		.unsafe_init_fn = git_hash_sha256_init,
+		.unsafe_clone_fn = git_hash_sha256_clone,
+		.unsafe_update_fn = git_hash_sha256_update,
+		.unsafe_final_fn = git_hash_sha256_final,
+		.unsafe_final_oid_fn = git_hash_sha256_final_oid,
+		.empty_tree = &empty_tree_oid_sha256,
+		.empty_blob = &empty_blob_oid_sha256,
+		.null_oid = &null_oid_sha256,
 	}
 };
 
@@ -221,16 +270,10 @@ const struct object_id *null_oid(void)
 	return the_hash_algo->null_oid;
 }
 
-const char *empty_tree_oid_hex(void)
+const char *empty_tree_oid_hex(const struct git_hash_algo *algop)
 {
 	static char buf[GIT_MAX_HEXSZ + 1];
-	return oid_to_hex_r(buf, the_hash_algo->empty_tree);
-}
-
-const char *empty_blob_oid_hex(void)
-{
-	static char buf[GIT_MAX_HEXSZ + 1];
-	return oid_to_hex_r(buf, the_hash_algo->empty_blob);
+	return oid_to_hex_r(buf, algop->empty_tree);
 }
 
 int hash_algo_by_name(const char *name)
@@ -264,33 +307,32 @@ int hash_algo_by_length(int len)
 
 /*
  * This is meant to hold a *small* number of objects that you would
- * want read_object_file() to be able to return, but yet you do not want
+ * want repo_read_object_file() to be able to return, but yet you do not want
  * to write them into the object store (e.g. a browse-only
  * application).
  */
-static struct cached_object {
+static struct cached_object_entry {
 	struct object_id oid;
-	enum object_type type;
-	void *buf;
-	unsigned long size;
+	struct cached_object {
+		enum object_type type;
+		const void *buf;
+		unsigned long size;
+	} value;
 } *cached_objects;
 static int cached_object_nr, cached_object_alloc;
 
-static struct cached_object empty_tree = {
-	{ EMPTY_TREE_SHA1_BIN_LITERAL },
-	OBJ_TREE,
-	"",
-	0
-};
-
-static struct cached_object *find_cached_object(const struct object_id *oid)
+static const struct cached_object *find_cached_object(const struct object_id *oid)
 {
+	static const struct cached_object empty_tree = {
+		.type = OBJ_TREE,
+		.buf = "",
+	};
 	int i;
-	struct cached_object *co = cached_objects;
+	const struct cached_object_entry *co = cached_objects;
 
 	for (i = 0; i < cached_object_nr; i++, co++) {
 		if (oideq(&co->oid, oid))
-			return co;
+			return &co->value;
 	}
 	if (oideq(oid, the_hash_algo->empty_tree))
 		return &empty_tree;
@@ -415,6 +457,39 @@ enum scld_error safe_create_leading_directories_const(const char *path)
 	return result;
 }
 
+int odb_mkstemp(struct strbuf *temp_filename, const char *pattern)
+{
+	int fd;
+	/*
+	 * we let the umask do its job, don't try to be more
+	 * restrictive except to remove write permission.
+	 */
+	int mode = 0444;
+	git_path_buf(temp_filename, "objects/%s", pattern);
+	fd = git_mkstemp_mode(temp_filename->buf, mode);
+	if (0 <= fd)
+		return fd;
+
+	/* slow path */
+	/* some mkstemp implementations erase temp_filename on failure */
+	git_path_buf(temp_filename, "objects/%s", pattern);
+	safe_create_leading_directories(temp_filename->buf);
+	return xmkstemp_mode(temp_filename->buf, mode);
+}
+
+int odb_pack_keep(const char *name)
+{
+	int fd;
+
+	fd = open(name, O_RDWR|O_CREAT|O_EXCL, 0600);
+	if (0 <= fd)
+		return fd;
+
+	/* slow path */
+	safe_create_leading_directories_const(name);
+	return open(name, O_RDWR|O_CREAT|O_EXCL, 0600);
+}
+
 static void fill_loose_path(struct strbuf *buf, const struct object_id *oid)
 {
 	int i;
@@ -505,7 +580,9 @@ static int link_alt_odb_entry(struct repository *r, const struct strbuf *entry,
 {
 	struct object_directory *ent;
 	struct strbuf pathbuf = STRBUF_INIT;
+	struct strbuf tmp = STRBUF_INIT;
 	khiter_t pos;
+	int ret = -1;
 
 	if (!is_absolute_path(entry->buf) && relative_base) {
 		strbuf_realpath(&pathbuf, relative_base, 1);
@@ -513,12 +590,12 @@ static int link_alt_odb_entry(struct repository *r, const struct strbuf *entry,
 	}
 	strbuf_addbuf(&pathbuf, entry);
 
-	if (strbuf_normalize_path(&pathbuf) < 0 && relative_base) {
+	if (!strbuf_realpath(&tmp, pathbuf.buf, 0)) {
 		error(_("unable to normalize alternate object path: %s"),
 		      pathbuf.buf);
-		strbuf_release(&pathbuf);
-		return -1;
+		goto error;
 	}
+	strbuf_swap(&pathbuf, &tmp);
 
 	/*
 	 * The trailing slash after the directory name is given by
@@ -527,10 +604,8 @@ static int link_alt_odb_entry(struct repository *r, const struct strbuf *entry,
 	while (pathbuf.len && pathbuf.buf[pathbuf.len - 1] == '/')
 		strbuf_setlen(&pathbuf, pathbuf.len - 1);
 
-	if (!alt_odb_usable(r->objects, &pathbuf, normalized_objdir, &pos)) {
-		strbuf_release(&pathbuf);
-		return -1;
-	}
+	if (!alt_odb_usable(r->objects, &pathbuf, normalized_objdir, &pos))
+		goto error;
 
 	CALLOC_ARRAY(ent, 1);
 	/* pathbuf.buf is already in r->objects->odb_by_path */
@@ -545,8 +620,11 @@ static int link_alt_odb_entry(struct repository *r, const struct strbuf *entry,
 
 	/* recursively add alternates */
 	read_info_alternates(r, ent->path, depth + 1);
-
-	return 0;
+	ret = 0;
+ error:
+	strbuf_release(&tmp);
+	strbuf_release(&pathbuf);
+	return ret;
 }
 
 static const char *parse_alt_odb_entry(const char *string,
@@ -593,10 +671,7 @@ static void link_alt_odb_entries(struct repository *r, const char *alt,
 		return;
 	}
 
-	strbuf_add_absolute_path(&objdirbuf, r->objects->odb->path);
-	if (strbuf_normalize_path(&objdirbuf) < 0)
-		die(_("unable to normalize object directory: %s"),
-		    objdirbuf.buf);
+	strbuf_realpath(&objdirbuf, r->objects->odb->path, 1);
 
 	while (*alt) {
 		alt = parse_alt_odb_entry(alt, sep, &entry);
@@ -681,6 +756,49 @@ void add_to_alternates_memory(const char *reference)
 
 	link_alt_odb_entries(the_repository, reference,
 			     '\n', NULL, 0);
+}
+
+struct object_directory *set_temporary_primary_odb(const char *dir, int will_destroy)
+{
+	struct object_directory *new_odb;
+
+	/*
+	 * Make sure alternates are initialized, or else our entry may be
+	 * overwritten when they are.
+	 */
+	prepare_alt_odb(the_repository);
+
+	/*
+	 * Make a new primary odb and link the old primary ODB in as an
+	 * alternate
+	 */
+	new_odb = xcalloc(1, sizeof(*new_odb));
+	new_odb->path = xstrdup(dir);
+
+	/*
+	 * Disable ref updates while a temporary odb is active, since
+	 * the objects in the database may roll back.
+	 */
+	new_odb->disable_ref_updates = 1;
+	new_odb->will_destroy = will_destroy;
+	new_odb->next = the_repository->objects->odb;
+	the_repository->objects->odb = new_odb;
+	return new_odb->next;
+}
+
+void restore_primary_odb(struct object_directory *restore_odb, const char *old_path)
+{
+	struct object_directory *cur_odb = the_repository->objects->odb;
+
+	if (strcmp(old_path, cur_odb->path))
+		BUG("expected %s as primary object store; found %s",
+		    old_path, cur_odb->path);
+
+	if (cur_odb->next != restore_odb)
+		BUG("we expect the old primary object store to be the first alternate");
+
+	the_repository->objects->odb = restore_odb;
+	free_object_directory(cur_odb);
 }
 
 /*
@@ -797,7 +915,7 @@ static void fill_alternate_refs_command(struct child_process *cmd,
 		}
 	}
 
-	cmd->env = local_repo_env;
+	strvec_pushv(&cmd->env, (const char **)local_repo_env);
 	cmd->out = -1;
 }
 
@@ -897,6 +1015,12 @@ void prepare_alt_odb(struct repository *r)
 	r->objects->loaded_alternates = 1;
 }
 
+int has_alt_odb(struct repository *r)
+{
+	prepare_alt_odb(r);
+	return !!r->objects->odb->next;
+}
+
 /* Returns 1 if we have successfully freshened the file, 0 otherwise. */
 static int freshen_file(const char *fn)
 {
@@ -956,7 +1080,7 @@ int has_loose_object_nonlocal(const struct object_id *oid)
 	return check_and_freshen_nonlocal(oid, 0);
 }
 
-static int has_loose_object(const struct object_id *oid)
+int has_loose_object(const struct object_id *oid)
 {
 	return check_and_freshen(oid, 0);
 }
@@ -1009,35 +1133,52 @@ void *xmmap(void *start, size_t length,
 	return ret;
 }
 
-/*
- * With an in-core object data in "map", rehash it to make sure the
- * object name actually matches "oid" to detect object corruption.
- * With "map" == NULL, try reading the object named with "oid" using
- * the streaming interface and rehash it to do the same.
- */
-int check_object_signature(struct repository *r, const struct object_id *oid,
-			   void *map, unsigned long size, const char *type,
-			   struct object_id *real_oidp)
+static int format_object_header_literally(char *str, size_t size,
+					  const char *type, size_t objsize)
 {
-	struct object_id tmp;
-	struct object_id *real_oid = real_oidp ? real_oidp : &tmp;
+	return xsnprintf(str, size, "%s %"PRIuMAX, type, (uintmax_t)objsize) + 1;
+}
+
+int format_object_header(char *str, size_t size, enum object_type type,
+			 size_t objsize)
+{
+	const char *name = type_name(type);
+
+	if (!name)
+		BUG("could not get a type name for 'enum object_type' value %d", type);
+
+	return format_object_header_literally(str, size, name, objsize);
+}
+
+int check_object_signature(struct repository *r, const struct object_id *oid,
+			   void *buf, unsigned long size,
+			   enum object_type type)
+{
+	const struct git_hash_algo *algo =
+		oid->algo ? &hash_algos[oid->algo] : r->hash_algo;
+	struct object_id real_oid;
+
+	hash_object_file(algo, buf, size, type, &real_oid);
+
+	return !oideq(oid, &real_oid) ? -1 : 0;
+}
+
+int stream_object_signature(struct repository *r, const struct object_id *oid)
+{
+	struct object_id real_oid;
+	unsigned long size;
 	enum object_type obj_type;
 	struct git_istream *st;
 	git_hash_ctx c;
 	char hdr[MAX_HEADER_LEN];
 	int hdrlen;
 
-	if (map) {
-		hash_object_file(r->hash_algo, map, size, type, real_oid);
-		return !oideq(oid, real_oid) ? -1 : 0;
-	}
-
 	st = open_istream(r, oid, &obj_type, &size, NULL);
 	if (!st)
 		return -1;
 
 	/* Generate the header */
-	hdrlen = xsnprintf(hdr, sizeof(hdr), "%s %"PRIuMAX , type_name(obj_type), (uintmax_t)size) + 1;
+	hdrlen = format_object_header(hdr, sizeof(hdr), obj_type, size);
 
 	/* Sha1.. */
 	r->hash_algo->init_fn(&c);
@@ -1054,9 +1195,9 @@ int check_object_signature(struct repository *r, const struct object_id *oid,
 			break;
 		r->hash_algo->update_fn(&c, buf, readlen);
 	}
-	r->hash_algo->final_oid_fn(real_oid, &c);
+	r->hash_algo->final_oid_fn(&real_oid, &c);
 	close_istream(st);
-	return !oideq(oid, real_oid) ? -1 : 0;
+	return !oideq(oid, &real_oid) ? -1 : 0;
 }
 
 int git_open_cloexec(const char *name, int flags)
@@ -1150,35 +1291,25 @@ static int quick_has_loose(struct repository *r,
 }
 
 /*
- * Map the loose object at "path" if it is not NULL, or the path found by
- * searching for a loose object named "oid".
+ * Map and close the given loose object fd. The path argument is used for
+ * error reporting.
  */
-static void *map_loose_object_1(struct repository *r, const char *path,
-			     const struct object_id *oid, unsigned long *size)
+static void *map_fd(int fd, const char *path, unsigned long *size)
 {
-	void *map;
-	int fd;
+	void *map = NULL;
+	struct stat st;
 
-	if (path)
-		fd = git_open(path);
-	else
-		fd = open_loose_object(r, oid, &path);
-	map = NULL;
-	if (fd >= 0) {
-		struct stat st;
-
-		if (!fstat(fd, &st)) {
-			*size = xsize_t(st.st_size);
-			if (!*size) {
-				/* mmap() is forbidden on empty files */
-				error(_("object file %s is empty"), path);
-				close(fd);
-				return NULL;
-			}
-			map = xmmap(NULL, *size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (!fstat(fd, &st)) {
+		*size = xsize_t(st.st_size);
+		if (!*size) {
+			/* mmap() is forbidden on empty files */
+			error(_("object file %s is empty"), path);
+			close(fd);
+			return NULL;
 		}
-		close(fd);
+		map = xmmap(NULL, *size, PROT_READ, MAP_PRIVATE, fd, 0);
 	}
+	close(fd);
 	return map;
 }
 
@@ -1186,7 +1317,12 @@ void *map_loose_object(struct repository *r,
 		       const struct object_id *oid,
 		       unsigned long *size)
 {
-	return map_loose_object_1(r, NULL, oid, size);
+	const char *p;
+	int fd = open_loose_object(r, oid, &p);
+
+	if (fd < 0)
+		return NULL;
+	return map_fd(fd, p, size);
 }
 
 enum unpack_loose_header_result unpack_loose_header(git_zstream *stream,
@@ -1306,7 +1442,7 @@ static void *unpack_loose_rest(git_zstream *stream,
 int parse_loose_header(const char *hdr, struct object_info *oi)
 {
 	const char *type_buf = hdr;
-	unsigned long size;
+	size_t size;
 	int type, type_len = 0;
 
 	/*
@@ -1341,12 +1477,12 @@ int parse_loose_header(const char *hdr, struct object_info *oi)
 			if (c > 9)
 				break;
 			hdr++;
-			size = size * 10 + c;
+			size = st_add(st_mult(size, 10), c);
 		}
 	}
 
 	if (oi->sizep)
-		*oi->sizep = size;
+		*oi->sizep = cast_size_t_to_ulong(size);
 
 	/*
 	 * The length must be followed by a zero byte
@@ -1366,7 +1502,9 @@ static int loose_object_info(struct repository *r,
 			     struct object_info *oi, int flags)
 {
 	int status = 0;
+	int fd;
 	unsigned long mapsize;
+	const char *path;
 	void *map;
 	git_zstream stream;
 	char hdr[MAX_HEADER_LEN];
@@ -1376,7 +1514,7 @@ static int loose_object_info(struct repository *r,
 	int allow_unknown = flags & OBJECT_INFO_ALLOW_UNKNOWN_TYPE;
 
 	if (oi->delta_base_oid)
-		oidclr(oi->delta_base_oid);
+		oidclr(oi->delta_base_oid, the_repository->hash_algo);
 
 	/*
 	 * If we don't care about type or size, then we don't
@@ -1387,7 +1525,6 @@ static int loose_object_info(struct repository *r,
 	 * object even exists.
 	 */
 	if (!oi->typep && !oi->type_name && !oi->sizep && !oi->contentp) {
-		const char *path;
 		struct stat st;
 		if (!oi->disk_sizep && (flags & OBJECT_INFO_QUICK))
 			return quick_has_loose(r, oid) ? 0 : -1;
@@ -1398,7 +1535,13 @@ static int loose_object_info(struct repository *r,
 		return 0;
 	}
 
-	map = map_loose_object(r, oid, &mapsize);
+	fd = open_loose_object(r, oid, &path);
+	if (fd < 0) {
+		if (errno != ENOENT)
+			error_errno(_("unable to open loose object %s"), oid_to_hex(oid));
+		return -1;
+	}
+	map = map_fd(fd, path, &mapsize);
 	if (!map)
 		return -1;
 
@@ -1435,6 +1578,10 @@ static int loose_object_info(struct repository *r,
 			       oid_to_hex(oid), MAX_HEADER_LEN);
 		break;
 	}
+
+	if (status && (flags & OBJECT_INFO_DIE_IF_CORRUPT))
+		die(_("loose object %s (stored in %s) is corrupt"),
+		    oid_to_hex(oid), path);
 
 	git_inflate_end(&stream);
 cleanup:
@@ -1476,7 +1623,7 @@ static int do_oid_object_info_extended(struct repository *r,
 				       struct object_info *oi, unsigned flags)
 {
 	static struct object_info blank_oi = OBJECT_INFO_INIT;
-	struct cached_object *co;
+	const struct cached_object *co;
 	struct pack_entry e;
 	int rtype;
 	const struct object_id *real = oid;
@@ -1501,7 +1648,7 @@ static int do_oid_object_info_extended(struct repository *r,
 		if (oi->disk_sizep)
 			*(oi->disk_sizep) = 0;
 		if (oi->delta_base_oid)
-			oidclr(oi->delta_base_oid);
+			oidclr(oi->delta_base_oid, the_repository->hash_algo);
 		if (oi->type_name)
 			strbuf_addstr(oi->type_name, type_name(co->type));
 		if (oi->contentp)
@@ -1513,9 +1660,6 @@ static int do_oid_object_info_extended(struct repository *r,
 	while (1) {
 		if (find_pack_entry(r, real, &e))
 			break;
-
-		if (flags & OBJECT_INFO_IGNORE_LOOSE)
-			return -1;
 
 		/* Most likely it's a loose object. */
 		if (!loose_object_info(r, real, oi, flags))
@@ -1543,15 +1687,20 @@ static int do_oid_object_info_extended(struct repository *r,
 		if (fetch_if_missing && repo_has_promisor_remote(r) &&
 		    !already_retried &&
 		    !(flags & OBJECT_INFO_SKIP_FETCH_OBJECT)) {
-			/*
-			 * TODO Investigate checking promisor_remote_get_direct()
-			 * TODO return value and stopping on error here.
-			 */
 			promisor_remote_get_direct(r, real, 1);
 			already_retried = 1;
 			continue;
 		}
 
+		if (flags & OBJECT_INFO_DIE_IF_CORRUPT) {
+			const struct packed_git *p;
+			if ((flags & OBJECT_INFO_LOOKUP_REPLACE) && !oideq(real, oid))
+				die(_("replacement %s not found for %s"),
+				    oid_to_hex(real), oid_to_hex(oid));
+			if ((p = has_packed_and_bad(r, real)))
+				die(_("packed object %s (stored in %s) is corrupt"),
+				    oid_to_hex(real), p->pack_name);
+		}
 		return -1;
 	}
 
@@ -1575,10 +1724,101 @@ static int do_oid_object_info_extended(struct repository *r,
 	return 0;
 }
 
+static int oid_object_info_convert(struct repository *r,
+				   const struct object_id *input_oid,
+				   struct object_info *input_oi, unsigned flags)
+{
+	const struct git_hash_algo *input_algo = &hash_algos[input_oid->algo];
+	int do_die = flags & OBJECT_INFO_DIE_IF_CORRUPT;
+	struct strbuf type_name = STRBUF_INIT;
+	struct object_id oid, delta_base_oid;
+	struct object_info new_oi, *oi;
+	unsigned long size;
+	void *content;
+	int ret;
+
+	if (repo_oid_to_algop(r, input_oid, the_hash_algo, &oid)) {
+		if (do_die)
+			die(_("missing mapping of %s to %s"),
+			    oid_to_hex(input_oid), the_hash_algo->name);
+		return -1;
+	}
+
+	/* Is new_oi needed? */
+	oi = input_oi;
+	if (input_oi && (input_oi->delta_base_oid || input_oi->sizep ||
+			 input_oi->contentp)) {
+		new_oi = *input_oi;
+		/* Does delta_base_oid need to be converted? */
+		if (input_oi->delta_base_oid)
+			new_oi.delta_base_oid = &delta_base_oid;
+		/* Will the attributes differ when converted? */
+		if (input_oi->sizep || input_oi->contentp) {
+			new_oi.contentp = &content;
+			new_oi.sizep = &size;
+			new_oi.type_name = &type_name;
+		}
+		oi = &new_oi;
+	}
+
+	ret = oid_object_info_extended(r, &oid, oi, flags);
+	if (ret)
+		return -1;
+	if (oi == input_oi)
+		return ret;
+
+	if (new_oi.contentp) {
+		struct strbuf outbuf = STRBUF_INIT;
+		enum object_type type;
+
+		type = type_from_string_gently(type_name.buf, type_name.len,
+					       !do_die);
+		if (type == -1)
+			return -1;
+		if (type != OBJ_BLOB) {
+			ret = convert_object_file(&outbuf,
+						  the_hash_algo, input_algo,
+						  content, size, type, !do_die);
+			free(content);
+			if (ret == -1)
+				return -1;
+			size = outbuf.len;
+			content = strbuf_detach(&outbuf, NULL);
+		}
+		if (input_oi->sizep)
+			*input_oi->sizep = size;
+		if (input_oi->contentp)
+			*input_oi->contentp = content;
+		else
+			free(content);
+		if (input_oi->type_name)
+			*input_oi->type_name = type_name;
+		else
+			strbuf_release(&type_name);
+	}
+	if (new_oi.delta_base_oid == &delta_base_oid) {
+		if (repo_oid_to_algop(r, &delta_base_oid, input_algo,
+				 input_oi->delta_base_oid)) {
+			if (do_die)
+				die(_("missing mapping of %s to %s"),
+				    oid_to_hex(&delta_base_oid),
+				    input_algo->name);
+			return -1;
+		}
+	}
+	input_oi->whence = new_oi.whence;
+	input_oi->u = new_oi.u;
+	return ret;
+}
+
 int oid_object_info_extended(struct repository *r, const struct object_id *oid,
 			     struct object_info *oi, unsigned flags)
 {
 	int ret;
+
+	if (oid->algo && (hash_algo_by_ptr(r->hash_algo) != oid->algo))
+		return oid_object_info_convert(r, oid, oi, flags);
+
 	obj_read_lock();
 	ret = do_oid_object_info_extended(r, oid, oi, flags);
 	obj_read_unlock();
@@ -1602,96 +1842,61 @@ int oid_object_info(struct repository *r,
 	return type;
 }
 
-static void *read_object(struct repository *r,
-			 const struct object_id *oid, enum object_type *type,
-			 unsigned long *size)
-{
-	struct object_info oi = OBJECT_INFO_INIT;
-	void *content;
-	oi.typep = type;
-	oi.sizep = size;
-	oi.contentp = &content;
-
-	if (oid_object_info_extended(r, oid, &oi, 0) < 0)
-		return NULL;
-	return content;
-}
-
 int pretend_object_file(void *buf, unsigned long len, enum object_type type,
 			struct object_id *oid)
 {
-	struct cached_object *co;
+	struct cached_object_entry *co;
+	char *co_buf;
 
-	hash_object_file(the_hash_algo, buf, len, type_name(type), oid);
-	if (has_object_file_with_flags(oid, OBJECT_INFO_QUICK | OBJECT_INFO_SKIP_FETCH_OBJECT) ||
+	hash_object_file(the_hash_algo, buf, len, type, oid);
+	if (repo_has_object_file_with_flags(the_repository, oid, OBJECT_INFO_QUICK | OBJECT_INFO_SKIP_FETCH_OBJECT) ||
 	    find_cached_object(oid))
 		return 0;
 	ALLOC_GROW(cached_objects, cached_object_nr + 1, cached_object_alloc);
 	co = &cached_objects[cached_object_nr++];
-	co->size = len;
-	co->type = type;
-	co->buf = xmalloc(len);
-	memcpy(co->buf, buf, len);
+	co->value.size = len;
+	co->value.type = type;
+	co_buf = xmalloc(len);
+	memcpy(co_buf, buf, len);
+	co->value.buf = co_buf;
 	oidcpy(&co->oid, oid);
 	return 0;
 }
 
 /*
  * This function dies on corrupt objects; the callers who want to
- * deal with them should arrange to call read_object() and give error
- * messages themselves.
+ * deal with them should arrange to call oid_object_info_extended() and give
+ * error messages themselves.
  */
-void *read_object_file_extended(struct repository *r,
-				const struct object_id *oid,
-				enum object_type *type,
-				unsigned long *size,
-				int lookup_replace)
+void *repo_read_object_file(struct repository *r,
+			    const struct object_id *oid,
+			    enum object_type *type,
+			    unsigned long *size)
 {
+	struct object_info oi = OBJECT_INFO_INIT;
+	unsigned flags = OBJECT_INFO_DIE_IF_CORRUPT | OBJECT_INFO_LOOKUP_REPLACE;
 	void *data;
-	const struct packed_git *p;
-	const char *path;
-	struct stat st;
-	const struct object_id *repl = lookup_replace ?
-		lookup_replace_object(r, oid) : oid;
 
-	errno = 0;
-	data = read_object(r, repl, type, size);
-	if (data)
-		return data;
+	oi.typep = type;
+	oi.sizep = size;
+	oi.contentp = &data;
+	if (oid_object_info_extended(r, oid, &oi, flags))
+		return NULL;
 
-	obj_read_lock();
-	if (errno && errno != ENOENT)
-		die_errno(_("failed to read object %s"), oid_to_hex(oid));
-
-	/* die if we replaced an object with one that does not exist */
-	if (repl != oid)
-		die(_("replacement %s not found for %s"),
-		    oid_to_hex(repl), oid_to_hex(oid));
-
-	if (!stat_loose_object(r, repl, &st, &path))
-		die(_("loose object %s (stored in %s) is corrupt"),
-		    oid_to_hex(repl), path);
-
-	if ((p = has_packed_and_bad(r, repl)) != NULL)
-		die(_("packed object %s (stored in %s) is corrupt"),
-		    oid_to_hex(repl), p->pack_name);
-	obj_read_unlock();
-
-	return NULL;
+	return data;
 }
 
 void *read_object_with_reference(struct repository *r,
 				 const struct object_id *oid,
-				 const char *required_type_name,
+				 enum object_type required_type,
 				 unsigned long *size,
 				 struct object_id *actual_oid_return)
 {
-	enum object_type type, required_type;
+	enum object_type type;
 	void *buffer;
 	unsigned long isize;
 	struct object_id actual_oid;
 
-	required_type = type_from_string(required_type_name);
 	oidcpy(&actual_oid, oid);
 	while (1) {
 		int ref_length = -1;
@@ -1729,21 +1934,96 @@ void *read_object_with_reference(struct repository *r,
 	}
 }
 
+static void hash_object_body(const struct git_hash_algo *algo, git_hash_ctx *c,
+			     const void *buf, unsigned long len,
+			     struct object_id *oid,
+			     char *hdr, int *hdrlen)
+{
+	algo->init_fn(c);
+	algo->update_fn(c, hdr, *hdrlen);
+	algo->update_fn(c, buf, len);
+	algo->final_oid_fn(oid, c);
+}
+
 static void write_object_file_prepare(const struct git_hash_algo *algo,
+				      const void *buf, unsigned long len,
+				      enum object_type type, struct object_id *oid,
+				      char *hdr, int *hdrlen)
+{
+	git_hash_ctx c;
+
+	/* Generate the header */
+	*hdrlen = format_object_header(hdr, *hdrlen, type, len);
+
+	/* Sha1.. */
+	hash_object_body(algo, &c, buf, len, oid, hdr, hdrlen);
+}
+
+static void write_object_file_prepare_literally(const struct git_hash_algo *algo,
 				      const void *buf, unsigned long len,
 				      const char *type, struct object_id *oid,
 				      char *hdr, int *hdrlen)
 {
 	git_hash_ctx c;
 
-	/* Generate the header */
-	*hdrlen = xsnprintf(hdr, *hdrlen, "%s %"PRIuMAX , type, (uintmax_t)len)+1;
+	*hdrlen = format_object_header_literally(hdr, *hdrlen, type, len);
+	hash_object_body(algo, &c, buf, len, oid, hdr, hdrlen);
+}
 
-	/* Sha1.. */
-	algo->init_fn(&c);
-	algo->update_fn(&c, hdr, *hdrlen);
-	algo->update_fn(&c, buf, len);
-	algo->final_oid_fn(oid, &c);
+#define CHECK_COLLISION_DEST_VANISHED -2
+
+static int check_collision(const char *source, const char *dest)
+{
+	char buf_source[4096], buf_dest[4096];
+	int fd_source = -1, fd_dest = -1;
+	int ret = 0;
+
+	fd_source = open(source, O_RDONLY);
+	if (fd_source < 0) {
+		ret = error_errno(_("unable to open %s"), source);
+		goto out;
+	}
+
+	fd_dest = open(dest, O_RDONLY);
+	if (fd_dest < 0) {
+		if (errno != ENOENT)
+			ret = error_errno(_("unable to open %s"), dest);
+		else
+			ret = CHECK_COLLISION_DEST_VANISHED;
+		goto out;
+	}
+
+	while (1) {
+		ssize_t sz_a, sz_b;
+
+		sz_a = read_in_full(fd_source, buf_source, sizeof(buf_source));
+		if (sz_a < 0) {
+			ret = error_errno(_("unable to read %s"), source);
+			goto out;
+		}
+
+		sz_b = read_in_full(fd_dest, buf_dest, sizeof(buf_dest));
+		if (sz_b < 0) {
+			ret = error_errno(_("unable to read %s"), dest);
+			goto out;
+		}
+
+		if (sz_a != sz_b || memcmp(buf_source, buf_dest, sz_a)) {
+			ret = error(_("files '%s' and '%s' differ in contents"),
+				    source, dest);
+			goto out;
+		}
+
+		if (sz_a < sizeof(buf_source))
+			break;
+	}
+
+out:
+	if (fd_source > -1)
+		close(fd_source);
+	if (fd_dest > -1)
+		close(fd_dest);
+	return ret;
 }
 
 /*
@@ -1751,12 +2031,24 @@ static void write_object_file_prepare(const struct git_hash_algo *algo,
  */
 int finalize_object_file(const char *tmpfile, const char *filename)
 {
-	int ret = 0;
+	return finalize_object_file_flags(tmpfile, filename, 0);
+}
+
+int finalize_object_file_flags(const char *tmpfile, const char *filename,
+			       enum finalize_object_file_flags flags)
+{
+	unsigned retries = 0;
+	int ret;
+
+retry:
+	ret = 0;
 
 	if (object_creation_mode == OBJECT_CREATION_USES_RENAMES)
 		goto try_rename;
 	else if (link(tmpfile, filename))
 		ret = errno;
+	else
+		unlink_or_warn(tmpfile);
 
 	/*
 	 * Coda hack - coda doesn't like cross-directory links,
@@ -1770,17 +2062,35 @@ int finalize_object_file(const char *tmpfile, const char *filename)
 	 * left to unlink.
 	 */
 	if (ret && ret != EEXIST) {
+		struct stat st;
+
 	try_rename:
-		if (!rename(tmpfile, filename))
+		if (!stat(filename, &st))
+			ret = EEXIST;
+		else if (!rename(tmpfile, filename))
 			goto out;
-		ret = errno;
+		else
+			ret = errno;
 	}
-	unlink_or_warn(tmpfile);
 	if (ret) {
 		if (ret != EEXIST) {
+			int saved_errno = errno;
+			unlink_or_warn(tmpfile);
+			errno = saved_errno;
 			return error_errno(_("unable to write file %s"), filename);
 		}
-		/* FIXME!!! Collision check here ? */
+		if (!(flags & FOF_SKIP_COLLISION_CHECK)) {
+			ret = check_collision(tmpfile, filename);
+			if (ret == CHECK_COLLISION_DEST_VANISHED) {
+				if (retries++ > 5)
+					return error(_("unable to write repeatedly vanishing file %s"),
+						     filename);
+				goto retry;
+			}
+			else if (ret)
+				return -1;
+		}
+		unlink_or_warn(tmpfile);
 	}
 
 out:
@@ -1789,28 +2099,38 @@ out:
 	return 0;
 }
 
-static int write_buffer(int fd, const void *buf, size_t len)
-{
-	if (write_in_full(fd, buf, len) < 0)
-		return error_errno(_("file write error"));
-	return 0;
-}
-
-int hash_object_file(const struct git_hash_algo *algo, const void *buf,
-		     unsigned long len, const char *type,
-		     struct object_id *oid)
+static void hash_object_file_literally(const struct git_hash_algo *algo,
+				       const void *buf, unsigned long len,
+				       const char *type, struct object_id *oid)
 {
 	char hdr[MAX_HEADER_LEN];
 	int hdrlen = sizeof(hdr);
-	write_object_file_prepare(algo, buf, len, type, oid, hdr, &hdrlen);
-	return 0;
+
+	write_object_file_prepare_literally(algo, buf, len, type, oid, hdr, &hdrlen);
+}
+
+void hash_object_file(const struct git_hash_algo *algo, const void *buf,
+		      unsigned long len, enum object_type type,
+		      struct object_id *oid)
+{
+	hash_object_file_literally(algo, buf, len, type_name(type), oid);
 }
 
 /* Finalize a file on disk, and close it. */
-static void close_loose_object(int fd)
+static void close_loose_object(int fd, const char *filename)
 {
-	if (fsync_object_files)
-		fsync_or_die(fd, "loose object file");
+	if (the_repository->objects->odb->will_destroy)
+		goto out;
+
+	if (batch_fsync_enabled(FSYNC_COMPONENT_LOOSE_OBJECT))
+		fsync_loose_object_bulk_checkin(fd, filename);
+	else if (fsync_object_files > 0)
+		fsync_or_die(fd, filename);
+	else
+		fsync_component_or_die(FSYNC_COMPONENT_LOOSE_OBJECT, fd,
+				       filename);
+
+out:
 	if (close(fd) != 0)
 		die_errno(_("error when closing loose object file"));
 }
@@ -1860,6 +2180,114 @@ static int create_tmpfile(struct strbuf *tmp, const char *filename)
 	return fd;
 }
 
+/**
+ * Common steps for loose object writers to start writing loose
+ * objects:
+ *
+ * - Create tmpfile for the loose object.
+ * - Setup zlib stream for compression.
+ * - Start to feed header to zlib stream.
+ *
+ * Returns a "fd", which should later be provided to
+ * end_loose_object_common().
+ */
+static int start_loose_object_common(struct strbuf *tmp_file,
+				     const char *filename, unsigned flags,
+				     git_zstream *stream,
+				     unsigned char *buf, size_t buflen,
+				     git_hash_ctx *c, git_hash_ctx *compat_c,
+				     char *hdr, int hdrlen)
+{
+	struct repository *repo = the_repository;
+	const struct git_hash_algo *algo = repo->hash_algo;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
+	int fd;
+
+	fd = create_tmpfile(tmp_file, filename);
+	if (fd < 0) {
+		if (flags & HASH_SILENT)
+			return -1;
+		else if (errno == EACCES)
+			return error(_("insufficient permission for adding "
+				       "an object to repository database %s"),
+				     repo_get_object_directory(the_repository));
+		else
+			return error_errno(
+				_("unable to create temporary file"));
+	}
+
+	/*  Setup zlib stream for compression */
+	git_deflate_init(stream, zlib_compression_level);
+	stream->next_out = buf;
+	stream->avail_out = buflen;
+	algo->init_fn(c);
+	if (compat && compat_c)
+		compat->init_fn(compat_c);
+
+	/*  Start to feed header to zlib stream */
+	stream->next_in = (unsigned char *)hdr;
+	stream->avail_in = hdrlen;
+	while (git_deflate(stream, 0) == Z_OK)
+		; /* nothing */
+	algo->update_fn(c, hdr, hdrlen);
+	if (compat && compat_c)
+		compat->update_fn(compat_c, hdr, hdrlen);
+
+	return fd;
+}
+
+/**
+ * Common steps for the inner git_deflate() loop for writing loose
+ * objects. Returns what git_deflate() returns.
+ */
+static int write_loose_object_common(git_hash_ctx *c, git_hash_ctx *compat_c,
+				     git_zstream *stream, const int flush,
+				     unsigned char *in0, const int fd,
+				     unsigned char *compressed,
+				     const size_t compressed_len)
+{
+	struct repository *repo = the_repository;
+	const struct git_hash_algo *algo = repo->hash_algo;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
+	int ret;
+
+	ret = git_deflate(stream, flush ? Z_FINISH : 0);
+	algo->update_fn(c, in0, stream->next_in - in0);
+	if (compat && compat_c)
+		compat->update_fn(compat_c, in0, stream->next_in - in0);
+	if (write_in_full(fd, compressed, stream->next_out - compressed) < 0)
+		die_errno(_("unable to write loose object file"));
+	stream->next_out = compressed;
+	stream->avail_out = compressed_len;
+
+	return ret;
+}
+
+/**
+ * Common steps for loose object writers to end writing loose objects:
+ *
+ * - End the compression of zlib stream.
+ * - Get the calculated oid to "oid".
+ */
+static int end_loose_object_common(git_hash_ctx *c, git_hash_ctx *compat_c,
+				   git_zstream *stream, struct object_id *oid,
+				   struct object_id *compat_oid)
+{
+	struct repository *repo = the_repository;
+	const struct git_hash_algo *algo = repo->hash_algo;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
+	int ret;
+
+	ret = git_deflate_end_gently(stream);
+	if (ret != Z_OK)
+		return ret;
+	algo->final_oid_fn(oid, c);
+	if (compat && compat_c)
+		compat->final_oid_fn(compat_oid, compat_c);
+
+	return Z_OK;
+}
+
 static int write_loose_object(const struct object_id *oid, char *hdr,
 			      int hdrlen, const void *buf, unsigned long len,
 			      time_t mtime, unsigned flags)
@@ -1872,57 +2300,39 @@ static int write_loose_object(const struct object_id *oid, char *hdr,
 	static struct strbuf tmp_file = STRBUF_INIT;
 	static struct strbuf filename = STRBUF_INIT;
 
+	if (batch_fsync_enabled(FSYNC_COMPONENT_LOOSE_OBJECT))
+		prepare_loose_object_bulk_checkin();
+
 	loose_object_path(the_repository, &filename, oid);
 
-	fd = create_tmpfile(&tmp_file, filename.buf);
-	if (fd < 0) {
-		if (flags & HASH_SILENT)
-			return -1;
-		else if (errno == EACCES)
-			return error(_("insufficient permission for adding an object to repository database %s"), get_object_directory());
-		else
-			return error_errno(_("unable to create temporary file"));
-	}
-
-	/* Set it up */
-	git_deflate_init(&stream, zlib_compression_level);
-	stream.next_out = compressed;
-	stream.avail_out = sizeof(compressed);
-	the_hash_algo->init_fn(&c);
-
-	/* First header.. */
-	stream.next_in = (unsigned char *)hdr;
-	stream.avail_in = hdrlen;
-	while (git_deflate(&stream, 0) == Z_OK)
-		; /* nothing */
-	the_hash_algo->update_fn(&c, hdr, hdrlen);
+	fd = start_loose_object_common(&tmp_file, filename.buf, flags,
+				       &stream, compressed, sizeof(compressed),
+				       &c, NULL, hdr, hdrlen);
+	if (fd < 0)
+		return -1;
 
 	/* Then the data itself.. */
 	stream.next_in = (void *)buf;
 	stream.avail_in = len;
 	do {
 		unsigned char *in0 = stream.next_in;
-		ret = git_deflate(&stream, Z_FINISH);
-		the_hash_algo->update_fn(&c, in0, stream.next_in - in0);
-		if (write_buffer(fd, compressed, stream.next_out - compressed) < 0)
-			die(_("unable to write loose object file"));
-		stream.next_out = compressed;
-		stream.avail_out = sizeof(compressed);
+
+		ret = write_loose_object_common(&c, NULL, &stream, 1, in0, fd,
+						compressed, sizeof(compressed));
 	} while (ret == Z_OK);
 
 	if (ret != Z_STREAM_END)
 		die(_("unable to deflate new object %s (%d)"), oid_to_hex(oid),
 		    ret);
-	ret = git_deflate_end_gently(&stream);
+	ret = end_loose_object_common(&c, NULL, &stream, &parano_oid, NULL);
 	if (ret != Z_OK)
 		die(_("deflateEnd on object %s failed (%d)"), oid_to_hex(oid),
 		    ret);
-	the_hash_algo->final_oid_fn(&parano_oid, &c);
 	if (!oideq(oid, &parano_oid))
 		die(_("confused by unstable object source data for %s"),
 		    oid_to_hex(oid));
 
-	close_loose_object(fd);
+	close_loose_object(fd, tmp_file.buf);
 
 	if (mtime) {
 		struct utimbuf utb;
@@ -1933,7 +2343,8 @@ static int write_loose_object(const struct object_id *oid, char *hdr,
 			warning_errno(_("failed utime() on %s"), tmp_file.buf);
 	}
 
-	return finalize_object_file(tmp_file.buf, filename.buf);
+	return finalize_object_file_flags(tmp_file.buf, filename.buf,
+					  FOF_SKIP_COLLISION_CHECK);
 }
 
 static int freshen_loose_object(const struct object_id *oid)
@@ -1946,6 +2357,8 @@ static int freshen_packed_object(const struct object_id *oid)
 	struct pack_entry e;
 	if (!find_pack_entry(the_repository, oid, &e))
 		return 0;
+	if (e.p->is_cruft)
+		return 0;
 	if (e.p->freshened)
 		return 1;
 	if (!freshen_file(e.p->pack_name))
@@ -1954,41 +2367,195 @@ static int freshen_packed_object(const struct object_id *oid)
 	return 1;
 }
 
-int write_object_file_flags(const void *buf, unsigned long len,
-			    const char *type, struct object_id *oid,
-			    unsigned flags)
+int stream_loose_object(struct input_stream *in_stream, size_t len,
+			struct object_id *oid)
 {
+	const struct git_hash_algo *compat = the_repository->compat_hash_algo;
+	struct object_id compat_oid;
+	int fd, ret, err = 0, flush = 0;
+	unsigned char compressed[4096];
+	git_zstream stream;
+	git_hash_ctx c, compat_c;
+	struct strbuf tmp_file = STRBUF_INIT;
+	struct strbuf filename = STRBUF_INIT;
+	int dirlen;
+	char hdr[MAX_HEADER_LEN];
+	int hdrlen;
+
+	if (batch_fsync_enabled(FSYNC_COMPONENT_LOOSE_OBJECT))
+		prepare_loose_object_bulk_checkin();
+
+	/* Since oid is not determined, save tmp file to odb path. */
+	strbuf_addf(&filename, "%s/", repo_get_object_directory(the_repository));
+	hdrlen = format_object_header(hdr, sizeof(hdr), OBJ_BLOB, len);
+
+	/*
+	 * Common steps for write_loose_object and stream_loose_object to
+	 * start writing loose objects:
+	 *
+	 *  - Create tmpfile for the loose object.
+	 *  - Setup zlib stream for compression.
+	 *  - Start to feed header to zlib stream.
+	 */
+	fd = start_loose_object_common(&tmp_file, filename.buf, 0,
+				       &stream, compressed, sizeof(compressed),
+				       &c, &compat_c, hdr, hdrlen);
+	if (fd < 0) {
+		err = -1;
+		goto cleanup;
+	}
+
+	/* Then the data itself.. */
+	do {
+		unsigned char *in0 = stream.next_in;
+
+		if (!stream.avail_in && !in_stream->is_finished) {
+			const void *in = in_stream->read(in_stream, &stream.avail_in);
+			stream.next_in = (void *)in;
+			in0 = (unsigned char *)in;
+			/* All data has been read. */
+			if (in_stream->is_finished)
+				flush = 1;
+		}
+		ret = write_loose_object_common(&c, &compat_c, &stream, flush, in0, fd,
+						compressed, sizeof(compressed));
+		/*
+		 * Unlike write_loose_object(), we do not have the entire
+		 * buffer. If we get Z_BUF_ERROR due to too few input bytes,
+		 * then we'll replenish them in the next input_stream->read()
+		 * call when we loop.
+		 */
+	} while (ret == Z_OK || ret == Z_BUF_ERROR);
+
+	if (stream.total_in != len + hdrlen)
+		die(_("write stream object %ld != %"PRIuMAX), stream.total_in,
+		    (uintmax_t)len + hdrlen);
+
+	/*
+	 * Common steps for write_loose_object and stream_loose_object to
+	 * end writing loose object:
+	 *
+	 *  - End the compression of zlib stream.
+	 *  - Get the calculated oid.
+	 */
+	if (ret != Z_STREAM_END)
+		die(_("unable to stream deflate new object (%d)"), ret);
+	ret = end_loose_object_common(&c, &compat_c, &stream, oid, &compat_oid);
+	if (ret != Z_OK)
+		die(_("deflateEnd on stream object failed (%d)"), ret);
+	close_loose_object(fd, tmp_file.buf);
+
+	if (freshen_packed_object(oid) || freshen_loose_object(oid)) {
+		unlink_or_warn(tmp_file.buf);
+		goto cleanup;
+	}
+
+	loose_object_path(the_repository, &filename, oid);
+
+	/* We finally know the object path, and create the missing dir. */
+	dirlen = directory_size(filename.buf);
+	if (dirlen) {
+		struct strbuf dir = STRBUF_INIT;
+		strbuf_add(&dir, filename.buf, dirlen);
+
+		if (mkdir_in_gitdir(dir.buf) && errno != EEXIST) {
+			err = error_errno(_("unable to create directory %s"), dir.buf);
+			strbuf_release(&dir);
+			goto cleanup;
+		}
+		strbuf_release(&dir);
+	}
+
+	err = finalize_object_file_flags(tmp_file.buf, filename.buf,
+					 FOF_SKIP_COLLISION_CHECK);
+	if (!err && compat)
+		err = repo_add_loose_object_map(the_repository, oid, &compat_oid);
+cleanup:
+	strbuf_release(&tmp_file);
+	strbuf_release(&filename);
+	return err;
+}
+
+int write_object_file_flags(const void *buf, unsigned long len,
+			    enum object_type type, struct object_id *oid,
+			    struct object_id *compat_oid_in, unsigned flags)
+{
+	struct repository *repo = the_repository;
+	const struct git_hash_algo *algo = repo->hash_algo;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
+	struct object_id compat_oid;
 	char hdr[MAX_HEADER_LEN];
 	int hdrlen = sizeof(hdr);
+
+	/* Generate compat_oid */
+	if (compat) {
+		if (compat_oid_in)
+			oidcpy(&compat_oid, compat_oid_in);
+		else if (type == OBJ_BLOB)
+			hash_object_file(compat, buf, len, type, &compat_oid);
+		else {
+			struct strbuf converted = STRBUF_INIT;
+			convert_object_file(&converted, algo, compat,
+					    buf, len, type, 0);
+			hash_object_file(compat, converted.buf, converted.len,
+					 type, &compat_oid);
+			strbuf_release(&converted);
+		}
+	}
 
 	/* Normally if we have it in the pack then we do not bother writing
 	 * it out into .git/objects/??/?{38} file.
 	 */
-	write_object_file_prepare(the_hash_algo, buf, len, type, oid, hdr,
-				  &hdrlen);
+	write_object_file_prepare(algo, buf, len, type, oid, hdr, &hdrlen);
 	if (freshen_packed_object(oid) || freshen_loose_object(oid))
 		return 0;
-	return write_loose_object(oid, hdr, hdrlen, buf, len, 0, flags);
+	if (write_loose_object(oid, hdr, hdrlen, buf, len, 0, flags))
+		return -1;
+	if (compat)
+		return repo_add_loose_object_map(repo, oid, &compat_oid);
+	return 0;
 }
 
-int hash_object_file_literally(const void *buf, unsigned long len,
-			       const char *type, struct object_id *oid,
-			       unsigned flags)
+int write_object_file_literally(const void *buf, unsigned long len,
+				const char *type, struct object_id *oid,
+				unsigned flags)
 {
 	char *header;
+	struct repository *repo = the_repository;
+	const struct git_hash_algo *algo = repo->hash_algo;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
+	struct object_id compat_oid;
 	int hdrlen, status = 0;
+	int compat_type = -1;
+
+	if (compat) {
+		compat_type = type_from_string_gently(type, -1, 1);
+		if (compat_type == OBJ_BLOB)
+			hash_object_file(compat, buf, len, compat_type,
+					 &compat_oid);
+		else if (compat_type != -1) {
+			struct strbuf converted = STRBUF_INIT;
+			convert_object_file(&converted, algo, compat,
+					    buf, len, compat_type, 0);
+			hash_object_file(compat, converted.buf, converted.len,
+					 compat_type, &compat_oid);
+			strbuf_release(&converted);
+		}
+	}
 
 	/* type string, SP, %lu of the length plus NUL must fit this */
 	hdrlen = strlen(type) + MAX_HEADER_LEN;
 	header = xmalloc(hdrlen);
-	write_object_file_prepare(the_hash_algo, buf, len, type, oid, header,
-				  &hdrlen);
+	write_object_file_prepare_literally(the_hash_algo, buf, len, type,
+					    oid, header, &hdrlen);
 
 	if (!(flags & HASH_WRITE_OBJECT))
 		goto cleanup;
 	if (freshen_packed_object(oid) || freshen_loose_object(oid))
 		goto cleanup;
 	status = write_loose_object(oid, header, hdrlen, buf, len, 0, 0);
+	if (compat_type != -1)
+		return repo_add_loose_object_map(repo, oid, &compat_oid);
 
 cleanup:
 	free(header);
@@ -1997,8 +2564,12 @@ cleanup:
 
 int force_object_loose(const struct object_id *oid, time_t mtime)
 {
+	struct repository *repo = the_repository;
+	const struct git_hash_algo *compat = repo->compat_hash_algo;
 	void *buf;
 	unsigned long len;
+	struct object_info oi = OBJECT_INFO_INIT;
+	struct object_id compat_oid;
 	enum object_type type;
 	char hdr[MAX_HEADER_LEN];
 	int hdrlen;
@@ -2006,11 +2577,20 @@ int force_object_loose(const struct object_id *oid, time_t mtime)
 
 	if (has_loose_object(oid))
 		return 0;
-	buf = read_object(the_repository, oid, &type, &len);
-	if (!buf)
+	oi.typep = &type;
+	oi.sizep = &len;
+	oi.contentp = &buf;
+	if (oid_object_info_extended(the_repository, oid, &oi, 0))
 		return error(_("cannot read object for %s"), oid_to_hex(oid));
-	hdrlen = xsnprintf(hdr, sizeof(hdr), "%s %"PRIuMAX , type_name(type), (uintmax_t)len) + 1;
+	if (compat) {
+		if (repo_oid_to_algop(repo, oid, compat, &compat_oid))
+			return error(_("cannot map object %s to %s"),
+				     oid_to_hex(oid), compat->name);
+	}
+	hdrlen = format_object_header(hdr, sizeof(hdr), type, len);
 	ret = write_loose_object(oid, hdr, hdrlen, buf, len, mtime, 0);
+	if (!ret && compat)
+		ret = repo_add_loose_object_map(the_repository, oid, &compat_oid);
 	free(buf);
 
 	return ret;
@@ -2042,40 +2622,30 @@ int repo_has_object_file(struct repository *r,
 	return repo_has_object_file_with_flags(r, oid, 0);
 }
 
-static void check_tree(const void *buf, size_t size)
+/*
+ * We can't use the normal fsck_error_function() for index_mem(),
+ * because we don't yet have a valid oid for it to report. Instead,
+ * report the minimal fsck error here, and rely on the caller to
+ * give more context.
+ */
+static int hash_format_check_report(struct fsck_options *opts UNUSED,
+				    void *fsck_report UNUSED,
+				    enum fsck_msg_type msg_type UNUSED,
+				    enum fsck_msg_id msg_id UNUSED,
+				    const char *message)
 {
-	struct tree_desc desc;
-	struct name_entry entry;
-
-	init_tree_desc(&desc, buf, size);
-	while (tree_entry(&desc, &entry))
-		/* do nothing
-		 * tree_entry() will die() on malformed entries */
-		;
-}
-
-static void check_commit(const void *buf, size_t size)
-{
-	struct commit c;
-	memset(&c, 0, sizeof(c));
-	if (parse_commit_buffer(the_repository, &c, buf, size, 0))
-		die(_("corrupt commit"));
-}
-
-static void check_tag(const void *buf, size_t size)
-{
-	struct tag t;
-	memset(&t, 0, sizeof(t));
-	if (parse_tag_buffer(the_repository, &t, buf, size))
-		die(_("corrupt tag"));
+	error(_("object fails fsck: %s"), message);
+	return 1;
 }
 
 static int index_mem(struct index_state *istate,
-		     struct object_id *oid, void *buf, size_t size,
+		     struct object_id *oid,
+		     const void *buf, size_t size,
 		     enum object_type type,
 		     const char *path, unsigned flags)
 {
-	int ret, re_allocated = 0;
+	struct strbuf nbuf = STRBUF_INIT;
+	int ret = 0;
 	int write_object = flags & HASH_WRITE_OBJECT;
 
 	if (!type)
@@ -2085,29 +2655,28 @@ static int index_mem(struct index_state *istate,
 	 * Convert blobs to git internal format
 	 */
 	if ((type == OBJ_BLOB) && path) {
-		struct strbuf nbuf = STRBUF_INIT;
 		if (convert_to_git(istate, path, buf, size, &nbuf,
 				   get_conv_flags(flags))) {
-			buf = strbuf_detach(&nbuf, &size);
-			re_allocated = 1;
+			buf = nbuf.buf;
+			size = nbuf.len;
 		}
 	}
 	if (flags & HASH_FORMAT_CHECK) {
-		if (type == OBJ_TREE)
-			check_tree(buf, size);
-		if (type == OBJ_COMMIT)
-			check_commit(buf, size);
-		if (type == OBJ_TAG)
-			check_tag(buf, size);
+		struct fsck_options opts = FSCK_OPTIONS_DEFAULT;
+
+		opts.strict = 1;
+		opts.error_func = hash_format_check_report;
+		if (fsck_buffer(null_oid(), type, buf, size, &opts))
+			die(_("refusing to create malformed object"));
+		fsck_finish(&opts);
 	}
 
 	if (write_object)
-		ret = write_object_file(buf, size, type_name(type), oid);
+		ret = write_object_file(buf, size, type, oid);
 	else
-		ret = hash_object_file(the_hash_algo, buf, size,
-				       type_name(type), oid);
-	if (re_allocated)
-		free(buf);
+		hash_object_file(the_hash_algo, buf, size, type, oid);
+
+	strbuf_release(&nbuf);
 	return ret;
 }
 
@@ -2117,7 +2686,7 @@ static int index_stream_convert_blob(struct index_state *istate,
 				     const char *path,
 				     unsigned flags)
 {
-	int ret;
+	int ret = 0;
 	const int write_object = flags & HASH_WRITE_OBJECT;
 	struct strbuf sbuf = STRBUF_INIT;
 
@@ -2128,11 +2697,11 @@ static int index_stream_convert_blob(struct index_state *istate,
 				 get_conv_flags(flags));
 
 	if (write_object)
-		ret = write_object_file(sbuf.buf, sbuf.len, type_name(OBJ_BLOB),
+		ret = write_object_file(sbuf.buf, sbuf.len, OBJ_BLOB,
 					oid);
 	else
-		ret = hash_object_file(the_hash_algo, sbuf.buf, sbuf.len,
-				       type_name(OBJ_BLOB), oid);
+		hash_object_file(the_hash_algo, sbuf.buf, sbuf.len, OBJ_BLOB,
+				 oid);
 	strbuf_release(&sbuf);
 	return ret;
 }
@@ -2198,11 +2767,11 @@ static int index_core(struct index_state *istate,
  * binary blobs, they generally do not want to get any conversion, and
  * callers should avoid this code path when filters are requested.
  */
-static int index_stream(struct object_id *oid, int fd, size_t size,
-			enum object_type type, const char *path,
-			unsigned flags)
+static int index_blob_stream(struct object_id *oid, int fd, size_t size,
+			     const char *path,
+			     unsigned flags)
 {
-	return index_bulk_checkin(oid, fd, size, type, path, flags);
+	return index_blob_bulk_checkin(oid, fd, size, path, flags);
 }
 
 int index_fd(struct index_state *istate, struct object_id *oid,
@@ -2224,8 +2793,8 @@ int index_fd(struct index_state *istate, struct object_id *oid,
 		ret = index_core(istate, oid, fd, xsize_t(st->st_size),
 				 type, path, flags);
 	else
-		ret = index_stream(oid, fd, xsize_t(st->st_size), type, path,
-				   flags);
+		ret = index_blob_stream(oid, fd, xsize_t(st->st_size), path,
+					flags);
 	close(fd);
 	return ret;
 }
@@ -2251,13 +2820,13 @@ int index_path(struct index_state *istate, struct object_id *oid,
 			return error_errno("readlink(\"%s\")", path);
 		if (!(flags & HASH_WRITE_OBJECT))
 			hash_object_file(the_hash_algo, sb.buf, sb.len,
-					 blob_type, oid);
-		else if (write_object_file(sb.buf, sb.len, blob_type, oid))
+					 OBJ_BLOB, oid);
+		else if (write_object_file(sb.buf, sb.len, OBJ_BLOB, oid))
 			rc = error(_("%s: failed to insert into database"), path);
 		strbuf_release(&sb);
 		break;
 	case S_IFDIR:
-		return resolve_gitlink_ref(path, "HEAD", oid);
+		return repo_resolve_gitlink_ref(the_repository, path, "HEAD", oid);
 	default:
 		return error(_("%s: unsupported file type"), path);
 	}
@@ -2331,6 +2900,8 @@ int for_each_file_in_obj_subdir(unsigned int subdir_nr,
 		    !hex_to_bytes(oid.hash + 1, de->d_name,
 				  the_hash_algo->rawsz - 1)) {
 			oid_set_algo(&oid, the_hash_algo);
+			memset(oid.hash + the_hash_algo->rawsz, 0,
+			       GIT_MAX_RAWSZ - the_hash_algo->rawsz);
 			if (obj_cb) {
 				r = obj_cb(&oid, path->buf, data);
 				if (r)
@@ -2411,7 +2982,8 @@ int for_each_loose_object(each_loose_object_fn cb, void *data,
 	return 0;
 }
 
-static int append_loose_object(const struct object_id *oid, const char *path,
+static int append_loose_object(const struct object_id *oid,
+			       const char *path UNUSED,
 			       void *data)
 {
 	oidtree_insert(data, oid);
@@ -2425,7 +2997,7 @@ struct oidtree *odb_loose_cache(struct object_directory *odb,
 	struct strbuf buf = STRBUF_INIT;
 	size_t word_bits = bitsizeof(odb->loose_objects_subdir_seen[0]);
 	size_t word_index = subdir_nr / word_bits;
-	size_t mask = 1u << (subdir_nr % word_bits);
+	size_t mask = (size_t)1u << (subdir_nr % word_bits);
 	uint32_t *bitmap;
 
 	if (subdir_nr < 0 ||
@@ -2522,21 +3094,25 @@ int read_loose_object(const char *path,
 		      struct object_info *oi)
 {
 	int ret = -1;
+	int fd;
 	void *map = NULL;
 	unsigned long mapsize;
 	git_zstream stream;
 	char hdr[MAX_HEADER_LEN];
 	unsigned long *size = oi->sizep;
 
-	map = map_loose_object_1(the_repository, path, NULL, &mapsize);
+	fd = git_open(path);
+	if (fd >= 0)
+		map = map_fd(fd, path, &mapsize);
 	if (!map) {
 		error_errno(_("unable to mmap %s"), path);
 		goto out;
 	}
 
 	if (unpack_loose_header(&stream, map, mapsize, hdr, sizeof(hdr),
-				NULL) < 0) {
+				NULL) != ULHR_OK) {
 		error(_("unable to unpack header of %s"), path);
+		git_inflate_end(&stream);
 		goto out;
 	}
 
@@ -2556,11 +3132,11 @@ int read_loose_object(const char *path,
 			git_inflate_end(&stream);
 			goto out;
 		}
-		if (check_object_signature(the_repository, expected_oid,
-					   *contents, *size, oi->type_name->buf, real_oid)) {
-			free(*contents);
+		hash_object_file_literally(the_repository->hash_algo,
+					   *contents, *size,
+					   oi->type_name->buf, real_oid);
+		if (!oideq(expected_oid, real_oid))
 			goto out;
-		}
 	}
 
 	ret = 0; /* everything checks out */

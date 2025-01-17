@@ -1,9 +1,10 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
-#include "commit.h"
-#include "tag.h"
+#include "advice.h"
+#include "gettext.h"
+#include "hash.h"
 #include "merge-recursive.h"
-#include "xdiff-interface.h"
+#include "object-name.h"
 
 static const char builtin_merge_recursive_usage[] =
 	"git %s <base>... -- <head> <remote> ...";
@@ -20,9 +21,12 @@ static char *better_branch_name(const char *branch)
 	return xstrdup(name ? name : branch);
 }
 
-int cmd_merge_recursive(int argc, const char **argv, const char *prefix)
+int cmd_merge_recursive(int argc,
+			const char **argv,
+			const char *prefix UNUSED,
+			struct repository *repo UNUSED)
 {
-	const struct object_id *bases[21];
+	struct object_id bases[21];
 	unsigned bases_count = 0;
 	int i, failed;
 	struct object_id h1, h2;
@@ -30,7 +34,7 @@ int cmd_merge_recursive(int argc, const char **argv, const char *prefix)
 	char *better1, *better2;
 	struct commit *result;
 
-	init_merge_options(&o, the_repository);
+	init_basic_merge_options(&o, the_repository);
 	if (argv[0] && ends_with(argv[0], "-subtree"))
 		o.subtree_shift = "";
 
@@ -48,17 +52,15 @@ int cmd_merge_recursive(int argc, const char **argv, const char *prefix)
 			continue;
 		}
 		if (bases_count < ARRAY_SIZE(bases)-1) {
-			struct object_id *oid = xmalloc(sizeof(struct object_id));
-			if (get_oid(argv[i], oid))
+			if (repo_get_oid(the_repository, argv[i], &bases[bases_count++]))
 				die(_("could not parse object '%s'"), argv[i]);
-			bases[bases_count++] = oid;
 		}
 		else
 			warning(Q_("cannot handle more than %d base. "
 				   "Ignoring %s.",
 				   "cannot handle more than %d bases. "
 				   "Ignoring %s.",
-				    (int)ARRAY_SIZE(bases)-1),
+				    ARRAY_SIZE(bases)-1),
 				(int)ARRAY_SIZE(bases)-1, argv[i]);
 	}
 	if (argc - i != 3) /* "--" "<head>" "<remote>" */
@@ -70,9 +72,9 @@ int cmd_merge_recursive(int argc, const char **argv, const char *prefix)
 	o.branch1 = argv[++i];
 	o.branch2 = argv[++i];
 
-	if (get_oid(o.branch1, &h1))
+	if (repo_get_oid(the_repository, o.branch1, &h1))
 		die(_("could not resolve ref '%s'"), o.branch1);
-	if (get_oid(o.branch2, &h2))
+	if (repo_get_oid(the_repository, o.branch2, &h2))
 		die(_("could not resolve ref '%s'"), o.branch2);
 
 	o.branch1 = better1 = better_branch_name(o.branch1);

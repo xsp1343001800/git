@@ -16,9 +16,9 @@ test_expect_success 'setup r1' '
 	git init r1 &&
 	for n in 1 2 3 4 5
 	do
-		echo "This is file: $n" > r1/file.$n
-		git -C r1 add file.$n
-		git -C r1 commit -m "$n"
+		echo "This is file: $n" > r1/file.$n &&
+		git -C r1 add file.$n &&
+		git -C r1 commit -m "$n" || return 1
 	done
 '
 
@@ -73,9 +73,9 @@ test_expect_success 'setup r2' '
 	git init r2 &&
 	for n in 1000 10000
 	do
-		printf "%"$n"s" X > r2/large.$n
-		git -C r2 add large.$n
-		git -C r2 commit -m "$n"
+		printf "%"$n"s" X > r2/large.$n &&
+		git -C r2 add large.$n &&
+		git -C r2 commit -m "$n" || return 1
 	done
 '
 
@@ -245,10 +245,10 @@ test_expect_success 'setup r3' '
 	mkdir r3/dir1 &&
 	for n in sparse1 sparse2
 	do
-		echo "This is file: $n" > r3/$n
-		git -C r3 add $n
-		echo "This is file: dir1/$n" > r3/dir1/$n
-		git -C r3 add dir1/$n
+		echo "This is file: $n" > r3/$n &&
+		git -C r3 add $n &&
+		echo "This is file: dir1/$n" > r3/dir1/$n &&
+		git -C r3 add dir1/$n || return 1
 	done &&
 	git -C r3 commit -m "sparse" &&
 	echo dir1/ >pattern1 &&
@@ -457,7 +457,7 @@ expect_invalid_filter_spec () {
 	test_must_fail git -C r3 rev-list --objects --filter="$spec" HEAD \
 		>actual 2>actual_stderr &&
 	test_must_be_empty actual &&
-	test_i18ngrep "$err" actual_stderr
+	test_grep "$err" actual_stderr
 }
 
 test_expect_success 'combine:... while URL-encoding things that should not be' '
@@ -670,9 +670,9 @@ test_expect_success 'rev-list W/ --missing=print' '
 	awk -f print_2.awk ls_files_result |
 	sort >expected &&
 
-	for id in `cat expected | sed "s|..|&/|"`
+	for id in `sed "s|..|&/|" expected`
 	do
-		rm r1/.git/objects/$id
+		rm r1/.git/objects/$id || return 1
 	done &&
 
 	git -C r1 rev-list --quiet --missing=print --objects HEAD >revs &&
@@ -699,6 +699,18 @@ test_expect_success 'expand blob limit in protocol' '
 		--filter=blob:limit=1k "file://$(pwd)/r2" limit &&
 	! grep "blob:limit=1k" trace &&
 	grep "blob:limit=1024" trace
+'
+
+test_expect_success EXPENSIVE 'large sparse filter file ignored' '
+	blob=$(dd if=/dev/zero bs=101M count=1 |
+	       git hash-object -w --stdin) &&
+	test_must_fail \
+		git rev-list --all --objects --filter=sparse:oid=$blob 2>err &&
+	cat >expect <<-EOF &&
+	warning: ignoring excessively large pattern blob: $blob
+	fatal: unable to parse sparse filter data in $blob
+	EOF
+	test_cmp expect err
 '
 
 test_done

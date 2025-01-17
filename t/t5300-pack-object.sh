@@ -3,9 +3,8 @@
 # Copyright (c) 2005 Junio C Hamano
 #
 
-test_description='git pack-object
+test_description='git pack-object'
 
-'
 . ./test-lib.sh
 
 test_expect_success 'setup' '
@@ -156,27 +155,37 @@ test_expect_success 'pack without delta' '
 	check_deltas stderr = 0
 '
 
+test_expect_success 'negative window clamps to 0' '
+	git pack-objects --progress --window=-1 neg-window <obj-list 2>stderr &&
+	check_deltas stderr = 0
+'
+
 test_expect_success 'pack-objects with bogus arguments' '
 	test_must_fail git pack-objects --window=0 test-1 blah blah <obj-list
 '
 
 check_unpack () {
+	local packname="$1" &&
+	local object_list="$2" &&
+	local git_config="$3" &&
 	test_when_finished "rm -rf git2" &&
-	git init --bare git2 &&
-	git -C git2 unpack-objects -n <"$1".pack &&
-	git -C git2 unpack-objects <"$1".pack &&
-	(cd .git && find objects -type f -print) |
-	while read path
-	do
-		cmp git2/$path .git/$path || {
-			echo $path differs.
-			return 1
-		}
-	done
+	git $git_config init --bare git2 &&
+	(
+		git $git_config -C git2 unpack-objects -n <"$packname".pack &&
+		git $git_config -C git2 unpack-objects <"$packname".pack &&
+		git $git_config -C git2 cat-file --batch-check="%(objectname)"
+	) <"$object_list" >current &&
+	cmp "$object_list" current
 }
 
 test_expect_success 'unpack without delta' '
-	check_unpack test-1-${packname_1}
+	check_unpack test-1-${packname_1} obj-list
+'
+
+BATCH_CONFIGURATION='-c core.fsync=loose-object -c core.fsyncmethod=batch'
+
+test_expect_success 'unpack without delta (core.fsyncmethod=batch)' '
+	check_unpack test-1-${packname_1} obj-list "$BATCH_CONFIGURATION"
 '
 
 test_expect_success 'pack with REF_DELTA' '
@@ -185,7 +194,11 @@ test_expect_success 'pack with REF_DELTA' '
 '
 
 test_expect_success 'unpack with REF_DELTA' '
-	check_unpack test-2-${packname_2}
+	check_unpack test-2-${packname_2} obj-list
+'
+
+test_expect_success 'unpack with REF_DELTA (core.fsyncmethod=batch)' '
+       check_unpack test-2-${packname_2} obj-list "$BATCH_CONFIGURATION"
 '
 
 test_expect_success 'pack with OFS_DELTA' '
@@ -195,7 +208,11 @@ test_expect_success 'pack with OFS_DELTA' '
 '
 
 test_expect_success 'unpack with OFS_DELTA' '
-	check_unpack test-3-${packname_3}
+	check_unpack test-3-${packname_3} obj-list
+'
+
+test_expect_success 'unpack with OFS_DELTA (core.fsyncmethod=batch)' '
+	check_unpack test-3-${packname_3} obj-list "$BATCH_CONFIGURATION"
 '
 
 test_expect_success 'compare delta flavors' '
@@ -250,95 +267,95 @@ test_expect_success 'survive missing objects/pack directory' '
 	)
 '
 
-test_expect_success \
-    'verify pack' \
-    'git verify-pack	test-1-${packname_1}.idx \
-			test-2-${packname_2}.idx \
-			test-3-${packname_3}.idx'
+test_expect_success 'verify pack' '
+	git verify-pack test-1-${packname_1}.idx \
+		test-2-${packname_2}.idx \
+		test-3-${packname_3}.idx
+'
 
-test_expect_success \
-    'verify pack -v' \
-    'git verify-pack -v	test-1-${packname_1}.idx \
-			test-2-${packname_2}.idx \
-			test-3-${packname_3}.idx'
+test_expect_success 'verify pack -v' '
+	git verify-pack -v test-1-${packname_1}.idx \
+		test-2-${packname_2}.idx \
+		test-3-${packname_3}.idx
+'
 
-test_expect_success \
-    'verify-pack catches mismatched .idx and .pack files' \
-    'cat test-1-${packname_1}.idx >test-3.idx &&
-     cat test-2-${packname_2}.pack >test-3.pack &&
-     if git verify-pack test-3.idx
-     then false
-     else :;
-     fi'
+test_expect_success 'verify-pack catches mismatched .idx and .pack files' '
+	cat test-1-${packname_1}.idx >test-3.idx &&
+	cat test-2-${packname_2}.pack >test-3.pack &&
+	if git verify-pack test-3.idx
+	then false
+	else :;
+	fi
+'
 
-test_expect_success \
-    'verify-pack catches a corrupted pack signature' \
-    'cat test-1-${packname_1}.pack >test-3.pack &&
-     echo | dd of=test-3.pack count=1 bs=1 conv=notrunc seek=2 &&
-     if git verify-pack test-3.idx
-     then false
-     else :;
-     fi'
+test_expect_success 'verify-pack catches a corrupted pack signature' '
+	cat test-1-${packname_1}.pack >test-3.pack &&
+	echo | dd of=test-3.pack count=1 bs=1 conv=notrunc seek=2 &&
+	if git verify-pack test-3.idx
+	then false
+	else :;
+	fi
+'
 
-test_expect_success \
-    'verify-pack catches a corrupted pack version' \
-    'cat test-1-${packname_1}.pack >test-3.pack &&
-     echo | dd of=test-3.pack count=1 bs=1 conv=notrunc seek=7 &&
-     if git verify-pack test-3.idx
-     then false
-     else :;
-     fi'
+test_expect_success 'verify-pack catches a corrupted pack version' '
+	cat test-1-${packname_1}.pack >test-3.pack &&
+	echo | dd of=test-3.pack count=1 bs=1 conv=notrunc seek=7 &&
+	if git verify-pack test-3.idx
+	then false
+	else :;
+	fi
+'
 
-test_expect_success \
-    'verify-pack catches a corrupted type/size of the 1st packed object data' \
-    'cat test-1-${packname_1}.pack >test-3.pack &&
-     echo | dd of=test-3.pack count=1 bs=1 conv=notrunc seek=12 &&
-     if git verify-pack test-3.idx
-     then false
-     else :;
-     fi'
+test_expect_success 'verify-pack catches a corrupted type/size of the 1st packed object data' '
+	cat test-1-${packname_1}.pack >test-3.pack &&
+	echo | dd of=test-3.pack count=1 bs=1 conv=notrunc seek=12 &&
+	if git verify-pack test-3.idx
+	then false
+	else :;
+	fi
+'
 
-test_expect_success \
-    'verify-pack catches a corrupted sum of the index file itself' \
-    'l=$(wc -c <test-3.idx) &&
-     l=$(expr $l - 20) &&
-     cat test-1-${packname_1}.pack >test-3.pack &&
-     printf "%20s" "" | dd of=test-3.idx count=20 bs=1 conv=notrunc seek=$l &&
-     if git verify-pack test-3.pack
-     then false
-     else :;
-     fi'
+test_expect_success 'verify-pack catches a corrupted sum of the index file itself' '
+	l=$(wc -c <test-3.idx) &&
+	l=$(expr $l - 20) &&
+	cat test-1-${packname_1}.pack >test-3.pack &&
+	printf "%20s" "" | dd of=test-3.idx count=20 bs=1 conv=notrunc seek=$l &&
+	if git verify-pack test-3.pack
+	then false
+	else :;
+	fi
+'
 
-test_expect_success \
-    'build pack index for an existing pack' \
-    'cat test-1-${packname_1}.pack >test-3.pack &&
-     git index-pack -o tmp.idx test-3.pack &&
-     cmp tmp.idx test-1-${packname_1}.idx &&
+test_expect_success 'build pack index for an existing pack' '
+	cat test-1-${packname_1}.pack >test-3.pack &&
+	git index-pack -o tmp.idx test-3.pack &&
+	cmp tmp.idx test-1-${packname_1}.idx &&
 
-     git index-pack test-3.pack &&
-     cmp test-3.idx test-1-${packname_1}.idx &&
+	git index-pack test-3.pack &&
+	cmp test-3.idx test-1-${packname_1}.idx &&
 
-     cat test-2-${packname_2}.pack >test-3.pack &&
-     git index-pack -o tmp.idx test-2-${packname_2}.pack &&
-     cmp tmp.idx test-2-${packname_2}.idx &&
+	cat test-2-${packname_2}.pack >test-3.pack &&
+	git index-pack -o tmp.idx test-2-${packname_2}.pack &&
+	cmp tmp.idx test-2-${packname_2}.idx &&
 
-     git index-pack test-3.pack &&
-     cmp test-3.idx test-2-${packname_2}.idx &&
+	git index-pack test-3.pack &&
+	cmp test-3.idx test-2-${packname_2}.idx &&
 
-     cat test-3-${packname_3}.pack >test-3.pack &&
-     git index-pack -o tmp.idx test-3-${packname_3}.pack &&
-     cmp tmp.idx test-3-${packname_3}.idx &&
+	cat test-3-${packname_3}.pack >test-3.pack &&
+	git index-pack -o tmp.idx test-3-${packname_3}.pack &&
+	cmp tmp.idx test-3-${packname_3}.idx &&
 
-     git index-pack test-3.pack &&
-     cmp test-3.idx test-3-${packname_3}.idx &&
+	git index-pack test-3.pack &&
+	cmp test-3.idx test-3-${packname_3}.idx &&
 
-     cat test-1-${packname_1}.pack >test-4.pack &&
-     rm -f test-4.keep &&
-     git index-pack --keep=why test-4.pack &&
-     cmp test-1-${packname_1}.idx test-4.idx &&
-     test -f test-4.keep &&
+	cat test-1-${packname_1}.pack >test-4.pack &&
+	rm -f test-4.keep &&
+	git index-pack --keep=why test-4.pack &&
+	cmp test-1-${packname_1}.idx test-4.idx &&
+	test -f test-4.keep &&
 
-     :'
+	:
+'
 
 test_expect_success 'unpacking with --strict' '
 
@@ -347,7 +364,7 @@ test_expect_success 'unpacking with --strict' '
 		for i in 0 1 2 3 4 5 6 7 8 9
 		do
 			o=$(echo $j$i | git hash-object -w --stdin) &&
-			echo "100644 $o	0 $j$i"
+			echo "100644 $o	0 $j$i" || return 1
 		done
 	done >LIST &&
 	rm -f .git/index &&
@@ -361,11 +378,7 @@ test_expect_success 'unpacking with --strict' '
 	ST=$(git write-tree) &&
 	git rev-list --objects "$LIST" "$LI" "$ST" >actual &&
 	PACK5=$( git pack-objects test-5 <actual ) &&
-	PACK6=$( (
-			echo "$LIST"
-			echo "$LI"
-			echo "$ST"
-		 ) | git pack-objects test-6 ) &&
+	PACK6=$( test_write_lines "$LIST" "$LI" "$ST" | git pack-objects test-6 ) &&
 	test_create_repo test-5 &&
 	(
 		cd test-5 &&
@@ -394,7 +407,7 @@ test_expect_success 'index-pack with --strict' '
 		for i in 0 1 2 3 4 5 6 7 8 9
 		do
 			o=$(echo $j$i | git hash-object -w --stdin) &&
-			echo "100644 $o	0 $j$i"
+			echo "100644 $o	0 $j$i" || return 1
 		done
 	done >LIST &&
 	rm -f .git/index &&
@@ -408,11 +421,7 @@ test_expect_success 'index-pack with --strict' '
 	ST=$(git write-tree) &&
 	git rev-list --objects "$LIST" "$LI" "$ST" >actual &&
 	PACK5=$( git pack-objects test-5 <actual ) &&
-	PACK6=$( (
-			echo "$LIST"
-			echo "$LI"
-			echo "$ST"
-		 ) | git pack-objects test-6 ) &&
+	PACK6=$( test_write_lines "$LIST" "$LI" "$ST" | git pack-objects test-6 ) &&
 	test_create_repo test-7 &&
 	(
 		cd test-7 &&
@@ -432,6 +441,47 @@ test_expect_success 'index-pack with --strict' '
 		cd test-7 &&
 		git index-pack --strict --stdin <../test-6-$PACK6.pack
 	)
+'
+
+test_expect_success 'setup for --strict and --fsck-objects downgrading fsck msgs' '
+	git init strict &&
+	(
+		cd strict &&
+		test_commit first hello &&
+		cat >commit <<-EOF &&
+		tree $(git rev-parse HEAD^{tree})
+		parent $(git rev-parse HEAD)
+		author A U Thor
+		committer A U Thor
+
+		commit: this is a commit with bad emails
+
+		EOF
+		git hash-object --literally -t commit -w --stdin <commit >commit_list &&
+		git pack-objects test <commit_list >pack-name
+	)
+'
+
+test_with_bad_commit () {
+	must_fail_arg="$1" &&
+	must_pass_arg="$2" &&
+	(
+		cd strict &&
+		test_must_fail git index-pack "$must_fail_arg" "test-$(cat pack-name).pack" &&
+		git index-pack "$must_pass_arg" "test-$(cat pack-name).pack"
+	)
+}
+
+test_expect_success 'index-pack with --strict downgrading fsck msgs' '
+	test_with_bad_commit --strict --strict="missingEmail=ignore"
+'
+
+test_expect_success 'index-pack with --fsck-objects downgrading fsck msgs' '
+	test_with_bad_commit --fsck-objects --fsck-objects="missingEmail=ignore"
+'
+
+test_expect_success 'cleanup for --strict and --fsck-objects downgrading fsck msgs' '
+	rm -rf strict
 '
 
 test_expect_success 'honor pack.packSizeLimit' '
@@ -474,6 +524,24 @@ test_expect_success 'index-pack --strict <pack> works in non-repo' '
 	nongit git index-pack --strict --object-format=$(test_oid algo) ../foo.pack &&
 	test_path_is_file foo.idx
 '
+
+test_expect_success SHA1 'show-index works OK outside a repository' '
+	nongit git show-index <foo.idx
+'
+
+for hash in sha1 sha256
+do
+	test_expect_success 'show-index works OK outside a repository with hash algo passed in via --object-format' '
+		test_when_finished "rm -rf explicit-hash-$hash" &&
+		git init --object-format=$hash explicit-hash-$hash &&
+		test_commit -C explicit-hash-$hash one &&
+		git -C explicit-hash-$hash rev-parse one >in &&
+		git -C explicit-hash-$hash pack-objects explicit-hash-$hash <in &&
+		idx=$(echo explicit-hash-$hash/explicit-hash-$hash*.idx) &&
+		nongit git show-index --object-format=$hash <"$idx" >actual &&
+		test_line_count = 1 actual
+	'
+done
 
 test_expect_success !PTHREADS,!FAIL_PREREQS \
 	'index-pack --threads=N or pack.threads=N warns when no pthreads' '
@@ -534,7 +602,7 @@ test_expect_success 'make sure index-pack detects the SHA1 collision' '
 	(
 		cd corrupt &&
 		test_must_fail git index-pack -o ../bad.idx ../test-3.pack 2>msg &&
-		test_i18ngrep "SHA1 COLLISION FOUND" msg
+		test_grep "SHA1 COLLISION FOUND" msg
 	)
 '
 
@@ -542,7 +610,7 @@ test_expect_success 'make sure index-pack detects the SHA1 collision (large blob
 	(
 		cd corrupt &&
 		test_must_fail git -c core.bigfilethreshold=1 index-pack -o ../bad.idx ../test-3.pack 2>msg &&
-		test_i18ngrep "SHA1 COLLISION FOUND" msg
+		test_grep "SHA1 COLLISION FOUND" msg
 	)
 '
 
@@ -582,144 +650,43 @@ test_expect_success 'prefetch objects' '
 	test_line_count = 1 donelines
 '
 
-test_expect_success 'setup for --stdin-packs tests' '
-	git init stdin-packs &&
-	(
-		cd stdin-packs &&
+for hash in sha1 sha256
+do
+	test_expect_success "verify-pack with $hash packfile" '
+		test_when_finished "rm -rf repo" &&
+		git init --object-format=$hash repo &&
+		test_commit -C repo initial &&
+		git -C repo repack -ad &&
+		git -C repo verify-pack "$(pwd)"/repo/.git/objects/pack/*.idx &&
+		if test $hash = sha1
+		then
+			nongit git verify-pack "$(pwd)"/repo/.git/objects/pack/*.idx
+		else
+			# We have no way to identify the hash used by packfiles
+			# or indices, so we always fall back to SHA1.
+			nongit test_must_fail git verify-pack "$(pwd)"/repo/.git/objects/pack/*.idx &&
+			# But with an explicit object format we should succeed.
+			nongit git verify-pack --object-format=$hash "$(pwd)"/repo/.git/objects/pack/*.idx
+		fi
+	'
 
-		test_commit A &&
-		test_commit B &&
-		test_commit C &&
-
-		for id in A B C
-		do
-			git pack-objects .git/objects/pack/pack-$id \
-				--incremental --revs <<-EOF
-			refs/tags/$id
-			EOF
-		done &&
-
-		ls -la .git/objects/pack
-	)
-'
-
-test_expect_success '--stdin-packs with excluded packs' '
-	(
-		cd stdin-packs &&
-
-		PACK_A="$(basename .git/objects/pack/pack-A-*.pack)" &&
-		PACK_B="$(basename .git/objects/pack/pack-B-*.pack)" &&
-		PACK_C="$(basename .git/objects/pack/pack-C-*.pack)" &&
-
-		git pack-objects test --stdin-packs <<-EOF &&
-		$PACK_A
-		^$PACK_B
-		$PACK_C
-		EOF
-
-		(
-			git show-index <$(ls .git/objects/pack/pack-A-*.idx) &&
-			git show-index <$(ls .git/objects/pack/pack-C-*.idx)
-		) >expect.raw &&
-		git show-index <$(ls test-*.idx) >actual.raw &&
-
-		cut -d" " -f2 <expect.raw | sort >expect &&
-		cut -d" " -f2 <actual.raw | sort >actual &&
-		test_cmp expect actual
-	)
-'
-
-test_expect_success '--stdin-packs is incompatible with --filter' '
-	(
-		cd stdin-packs &&
-		test_must_fail git pack-objects --stdin-packs --stdout \
-			--filter=blob:none </dev/null 2>err &&
-		test_i18ngrep "cannot use --filter with --stdin-packs" err
-	)
-'
-
-test_expect_success '--stdin-packs is incompatible with --revs' '
-	(
-		cd stdin-packs &&
-		test_must_fail git pack-objects --stdin-packs --revs out \
-			</dev/null 2>err &&
-		test_i18ngrep "cannot use internal rev list with --stdin-packs" err
-	)
-'
-
-test_expect_success '--stdin-packs with loose objects' '
-	(
-		cd stdin-packs &&
-
-		PACK_A="$(basename .git/objects/pack/pack-A-*.pack)" &&
-		PACK_B="$(basename .git/objects/pack/pack-B-*.pack)" &&
-		PACK_C="$(basename .git/objects/pack/pack-C-*.pack)" &&
-
-		test_commit D && # loose
-
-		git pack-objects test2 --stdin-packs --unpacked <<-EOF &&
-		$PACK_A
-		^$PACK_B
-		$PACK_C
-		EOF
-
-		(
-			git show-index <$(ls .git/objects/pack/pack-A-*.idx) &&
-			git show-index <$(ls .git/objects/pack/pack-C-*.idx) &&
-			git rev-list --objects --no-object-names \
-				refs/tags/C..refs/tags/D
-
-		) >expect.raw &&
-		ls -la . &&
-		git show-index <$(ls test2-*.idx) >actual.raw &&
-
-		cut -d" " -f2 <expect.raw | sort >expect &&
-		cut -d" " -f2 <actual.raw | sort >actual &&
-		test_cmp expect actual
-	)
-'
-
-test_expect_success '--stdin-packs with broken links' '
-	(
-		cd stdin-packs &&
-
-		# make an unreachable object with a bogus parent
-		git cat-file -p HEAD >commit &&
-		sed "s/$(git rev-parse HEAD^)/$(test_oid zero)/" <commit |
-		git hash-object -w -t commit --stdin >in &&
-
-		git pack-objects .git/objects/pack/pack-D <in &&
-
-		PACK_A="$(basename .git/objects/pack/pack-A-*.pack)" &&
-		PACK_B="$(basename .git/objects/pack/pack-B-*.pack)" &&
-		PACK_C="$(basename .git/objects/pack/pack-C-*.pack)" &&
-		PACK_D="$(basename .git/objects/pack/pack-D-*.pack)" &&
-
-		git pack-objects test3 --stdin-packs --unpacked <<-EOF &&
-		$PACK_A
-		^$PACK_B
-		$PACK_C
-		$PACK_D
-		EOF
-
-		(
-			git show-index <$(ls .git/objects/pack/pack-A-*.idx) &&
-			git show-index <$(ls .git/objects/pack/pack-C-*.idx) &&
-			git show-index <$(ls .git/objects/pack/pack-D-*.idx) &&
-			git rev-list --objects --no-object-names \
-				refs/tags/C..refs/tags/D
-		) >expect.raw &&
-		git show-index <$(ls test3-*.idx) >actual.raw &&
-
-		cut -d" " -f2 <expect.raw | sort >expect &&
-		cut -d" " -f2 <actual.raw | sort >actual &&
-		test_cmp expect actual
-	)
-'
-
-test_expect_success 'negative window clamps to 0' '
-	git pack-objects --progress --window=-1 neg-window <obj-list 2>stderr &&
-	check_deltas stderr = 0
-'
+	test_expect_success "index-pack outside of a $hash repository" '
+		test_when_finished "rm -rf repo" &&
+		git init --object-format=$hash repo &&
+		test_commit -C repo initial &&
+		git -C repo repack -ad &&
+		git -C repo index-pack --verify "$(pwd)"/repo/.git/objects/pack/*.pack &&
+		if test $hash = sha1
+		then
+			nongit git index-pack --verify "$(pwd)"/repo/.git/objects/pack/*.pack
+		else
+			# We have no way to identify the hash used by packfiles
+			# or indices, so we always fall back to SHA1.
+			nongit test_must_fail git index-pack --verify "$(pwd)"/repo/.git/objects/pack/*.pack 2>err &&
+			# But with an explicit object format we should succeed.
+			nongit git index-pack --object-format=$hash --verify "$(pwd)"/repo/.git/objects/pack/*.pack
+		fi
+	'
+done
 
 test_done

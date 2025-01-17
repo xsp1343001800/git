@@ -11,19 +11,30 @@
  *
  * Copyright (C) 2016 Johannes Schindelin
  */
-#define USE_THE_INDEX_COMPATIBILITY_MACROS
-#include "cache.h"
-#include "config.h"
+
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "builtin.h"
+
+#include "abspath.h"
+#include "config.h"
+#include "copy.h"
 #include "run-command.h"
-#include "exec-cmd.h"
+#include "environment.h"
+#include "gettext.h"
+#include "hex.h"
 #include "parse-options.h"
+#include "read-cache-ll.h"
+#include "repository.h"
+#include "sparse-index.h"
 #include "strvec.h"
 #include "strbuf.h"
 #include "lockfile.h"
-#include "object-store.h"
+#include "object-file.h"
+#include "object-store-ll.h"
 #include "dir.h"
 #include "entry.h"
+#include "setup.h"
 
 static int trust_exit_code;
 
@@ -32,20 +43,24 @@ static const char *const builtin_difftool_usage[] = {
 	NULL
 };
 
-static int difftool_config(const char *var, const char *value, void *cb)
+static int difftool_config(const char *var, const char *value,
+			   const struct config_context *ctx, void *cb)
 {
 	if (!strcmp(var, "difftool.trustexitcode")) {
 		trust_exit_code = git_config_bool(var, value);
 		return 0;
 	}
 
-	return git_default_config(var, value, cb);
+	return git_default_config(var, value, ctx, cb);
 }
 
 static int print_tool_help(void)
 {
-	const char *argv[] = { "mergetool", "--tool-help=diff", NULL };
-	return run_command_v_opt(argv, RUN_GIT_CMD);
+	struct child_process cmd = CHILD_PROCESS_INIT;
+
+	cmd.git_cmd = 1;
+	strvec_pushl(&cmd.args, "mergetool", "--tool-help=diff", NULL);
+	return run_command(&cmd);
 }
 
 static int parse_index_info(char *p, int *mode1, int *mode2,
@@ -106,7 +121,7 @@ static int use_wt_file(const char *workdir, const char *name,
 		int fd = open(buf.buf, O_RDONLY);
 
 		if (fd >= 0 &&
-		    !index_fd(&the_index, &wt_oid, fd, &st, OBJ_BLOB, name, 0)) {
+		    !index_fd(the_repository->index, &wt_oid, fd, &st, OBJ_BLOB, name, 0)) {
 			if (is_null_oid(oid)) {
 				oidcpy(oid, &wt_oid);
 				use = 1;
@@ -125,10 +140,10 @@ struct working_tree_entry {
 	char path[FLEX_ARRAY];
 };
 
-static int working_tree_entry_cmp(const void *unused_cmp_data,
+static int working_tree_entry_cmp(const void *cmp_data UNUSED,
 				  const struct hashmap_entry *eptr,
 				  const struct hashmap_entry *entry_or_key,
-				  const void *unused_keydata)
+				  const void *keydata UNUSED)
 {
 	const struct working_tree_entry *a, *b;
 
@@ -148,10 +163,10 @@ struct pair_entry {
 	const char path[FLEX_ARRAY];
 };
 
-static int pair_cmp(const void *unused_cmp_data,
+static int pair_cmp(const void *cmp_data UNUSED,
 		    const struct hashmap_entry *eptr,
 		    const struct hashmap_entry *entry_or_key,
-		    const void *unused_keydata)
+		    const void *keydata UNUSED)
 {
 	const struct pair_entry *a, *b;
 
@@ -184,7 +199,7 @@ struct path_entry {
 	char path[FLEX_ARRAY];
 };
 
-static int path_entry_cmp(const void *unused_cmp_data,
+static int path_entry_cmp(const void *cmp_data UNUSED,
 			  const struct hashmap_entry *eptr,
 			  const struct hashmap_entry *entry_or_key,
 			  const void *key)
@@ -202,14 +217,9 @@ static void changed_files(struct hashmap *result, const char *index_path,
 {
 	struct child_process update_index = CHILD_PROCESS_INIT;
 	struct child_process diff_files = CHILD_PROCESS_INIT;
-	struct strbuf index_env = STRBUF_INIT, buf = STRBUF_INIT;
-	const char *git_dir = absolute_path(get_git_dir()), *env[] = {
-		NULL, NULL
-	};
+	struct strbuf buf = STRBUF_INIT;
+	const char *git_dir = absolute_path(repo_get_git_dir(the_repository));
 	FILE *fp;
-
-	strbuf_addf(&index_env, "GIT_INDEX_FILE=%s", index_path);
-	env[0] = index_env.buf;
 
 	strvec_pushl(&update_index.args,
 		     "--git-dir", git_dir, "--work-tree", workdir,
@@ -222,7 +232,7 @@ static void changed_files(struct hashmap *result, const char *index_path,
 	update_index.use_shell = 0;
 	update_index.clean_on_exit = 1;
 	update_index.dir = workdir;
-	update_index.env = env;
+	strvec_pushf(&update_index.env, "GIT_INDEX_FILE=%s", index_path);
 	/* Ignore any errors of update-index */
 	run_command(&update_index);
 
@@ -235,7 +245,7 @@ static void changed_files(struct hashmap *result, const char *index_path,
 	diff_files.clean_on_exit = 1;
 	diff_files.out = -1;
 	diff_files.dir = workdir;
-	diff_files.env = env;
+	strvec_pushf(&diff_files.env, "GIT_INDEX_FILE=%s", index_path);
 	if (start_command(&diff_files))
 		die("could not obtain raw diff");
 	fp = xfdopen(diff_files.out, "r");
@@ -248,7 +258,6 @@ static void changed_files(struct hashmap *result, const char *index_path,
 	fclose(fp);
 	if (finish_command(&diff_files))
 		die("diff-files did not exit properly");
-	strbuf_release(&index_env);
 	strbuf_release(&buf);
 }
 
@@ -298,7 +307,8 @@ static char *get_symlink(const struct object_id *oid, const char *path)
 	} else {
 		enum object_type type;
 		unsigned long size;
-		data = read_object_file(oid, &type, &size);
+		data = repo_read_object_file(the_repository, oid, &type,
+					     &size);
 		if (!data)
 			die(_("could not read object %s for symlink %s"),
 				oid_to_hex(oid), path);
@@ -332,7 +342,7 @@ static void write_file_in_directory(struct strbuf *dir, size_t dir_len,
 /* Write the file contents for the left and right sides of the difftool
  * dir-diff representation for submodules and symlinks. Symlinks and submodules
  * are written as regular text files so that external diff tools can diff them
- * as text files, resulting in behavior that is analogous to to what "git diff"
+ * as text files, resulting in behavior that is analogous to what "git diff"
  * displays for symlink and submodule diffs.
  */
 static void write_standin_files(struct pair_entry *entry,
@@ -356,7 +366,8 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 	char *lbase_dir = NULL, *rbase_dir = NULL;
 	size_t ldir_len, rdir_len, wtdir_len;
 	const char *workdir, *tmp;
-	int ret = 0, i;
+	int ret = 0;
+	size_t i;
 	FILE *fp = NULL;
 	struct hashmap working_tree_dups = HASHMAP_INIT(working_tree_entry_cmp,
 							NULL);
@@ -364,14 +375,15 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 	struct hashmap symlinks2 = HASHMAP_INIT(pair_cmp, NULL);
 	struct hashmap_iter iter;
 	struct pair_entry *entry;
-	struct index_state wtindex;
+	struct index_state wtindex = INDEX_STATE_INIT(the_repository);
 	struct checkout lstate, rstate;
-	int flags = RUN_GIT_CMD, err = 0;
-	const char *helper_argv[] = { "difftool--helper", NULL, NULL, NULL };
-	struct hashmap wt_modified, tmp_modified;
+	int err = 0;
+	struct child_process cmd = CHILD_PROCESS_INIT;
+	struct hashmap wt_modified = HASHMAP_INIT(path_entry_cmp, NULL);
+	struct hashmap tmp_modified = HASHMAP_INIT(path_entry_cmp, NULL);
 	int indices_loaded = 0;
 
-	workdir = get_git_work_tree();
+	workdir = repo_get_work_tree(the_repository);
 
 	/* Setup temp directories */
 	tmp = getenv("TMPDIR");
@@ -389,8 +401,6 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 		strbuf_addch(&wtdir, '/');
 	mkdir(ldir.buf, 0700);
 	mkdir(rdir.buf, 0700);
-
-	memset(&wtindex, 0, sizeof(wtindex));
 
 	memset(&lstate, 0, sizeof(lstate));
 	lstate.base_dir = lbase_dir = xstrdup(ldir.buf);
@@ -569,16 +579,17 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 	}
 
 	strbuf_setlen(&ldir, ldir_len);
-	helper_argv[1] = ldir.buf;
 	strbuf_setlen(&rdir, rdir_len);
-	helper_argv[2] = rdir.buf;
 
 	if (extcmd) {
-		helper_argv[0] = extcmd;
-		flags = 0;
-	} else
+		strvec_push(&cmd.args, extcmd);
+	} else {
+		strvec_push(&cmd.args, "difftool--helper");
+		cmd.git_cmd = 1;
 		setenv("GIT_DIFFTOOL_DIRDIFF", "true", 1);
-	ret = run_command_v_opt(helper_argv, flags);
+	}
+	strvec_pushl(&cmd.args, ldir.buf, rdir.buf, NULL);
+	ret = run_command(&cmd);
 
 	/* TODO: audit for interaction with sparse-index. */
 	ensure_full_index(&wtindex);
@@ -594,9 +605,6 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 	 * in the common case of --symlinks and the difftool updating
 	 * files through the symlink.
 	 */
-	hashmap_init(&wt_modified, path_entry_cmp, NULL, wtindex.cache_nr);
-	hashmap_init(&tmp_modified, path_entry_cmp, NULL, wtindex.cache_nr);
-
 	for (i = 0; i < wtindex.cache_nr; i++) {
 		struct hashmap_entry dummy;
 		const char *name = wtindex.cache[i]->name;
@@ -655,8 +663,17 @@ finish:
 	if (fp)
 		fclose(fp);
 
+	hashmap_clear_and_free(&working_tree_dups, struct working_tree_entry, entry);
+	hashmap_clear_and_free(&wt_modified, struct path_entry, entry);
+	hashmap_clear_and_free(&tmp_modified, struct path_entry, entry);
+	hashmap_clear_and_free(&submodules, struct pair_entry, entry);
+	hashmap_clear_and_free(&symlinks2, struct pair_entry, entry);
+	release_index(&wtindex);
 	free(lbase_dir);
 	free(rbase_dir);
+	strbuf_release(&info);
+	strbuf_release(&lpath);
+	strbuf_release(&rpath);
 	strbuf_release(&ldir);
 	strbuf_release(&rdir);
 	strbuf_release(&wtdir);
@@ -669,26 +686,25 @@ finish:
 static int run_file_diff(int prompt, const char *prefix,
 			 struct child_process *child)
 {
-	const char *env[] = {
-		"GIT_PAGER=", "GIT_EXTERNAL_DIFF=git-difftool--helper", NULL,
-		NULL
-	};
-
+	strvec_push(&child->env, "GIT_PAGER=");
+	strvec_push(&child->env, "GIT_EXTERNAL_DIFF=git-difftool--helper");
 	if (prompt > 0)
-		env[2] = "GIT_DIFFTOOL_PROMPT=true";
+		strvec_push(&child->env, "GIT_DIFFTOOL_PROMPT=true");
 	else if (!prompt)
-		env[2] = "GIT_DIFFTOOL_NO_PROMPT=true";
+		strvec_push(&child->env, "GIT_DIFFTOOL_NO_PROMPT=true");
 
 	child->git_cmd = 1;
 	child->dir = prefix;
-	strvec_pushv(&child->env_array, env);
 
 	return run_command(child);
 }
 
-int cmd_difftool(int argc, const char **argv, const char *prefix)
+int cmd_difftool(int argc,
+		 const char **argv,
+		 const char *prefix,
+		 struct repository *repo UNUSED)
 {
-	int use_gui_tool = 0, dir_diff = 0, prompt = -1, symlinks = 0,
+	int use_gui_tool = -1, dir_diff = 0, prompt = -1, symlinks = 0,
 	    tool_help = 0, no_index = 0;
 	static char *difftool_cmd = NULL, *extcmd = NULL;
 	struct option builtin_difftool_options[] = {
@@ -722,7 +738,7 @@ int cmd_difftool(int argc, const char **argv, const char *prefix)
 	symlinks = has_symlinks;
 
 	argc = parse_options(argc, argv, prefix, builtin_difftool_options,
-			     builtin_difftool_usage, PARSE_OPT_KEEP_UNKNOWN |
+			     builtin_difftool_usage, PARSE_OPT_KEEP_UNKNOWN_OPT |
 			     PARSE_OPT_KEEP_DASHDASH);
 
 	if (tool_help)
@@ -733,17 +749,26 @@ int cmd_difftool(int argc, const char **argv, const char *prefix)
 
 	if (!no_index){
 		setup_work_tree();
-		setenv(GIT_DIR_ENVIRONMENT, absolute_path(get_git_dir()), 1);
-		setenv(GIT_WORK_TREE_ENVIRONMENT, absolute_path(get_git_work_tree()), 1);
+		setenv(GIT_DIR_ENVIRONMENT, absolute_path(repo_get_git_dir(the_repository)), 1);
+		setenv(GIT_WORK_TREE_ENVIRONMENT, absolute_path(repo_get_work_tree(the_repository)), 1);
 	} else if (dir_diff)
-		die(_("--dir-diff is incompatible with --no-index"));
+		die(_("options '%s' and '%s' cannot be used together"), "--dir-diff", "--no-index");
 
-	if (use_gui_tool + !!difftool_cmd + !!extcmd > 1)
-		die(_("--gui, --tool and --extcmd are mutually exclusive"));
+	die_for_incompatible_opt3(use_gui_tool == 1, "--gui",
+				  !!difftool_cmd, "--tool",
+				  !!extcmd, "--extcmd");
 
-	if (use_gui_tool)
+	/*
+	 * Explicitly specified GUI option is forwarded to git-mergetool--lib.sh;
+	 * empty or unset means "use the difftool.guiDefault config or default to
+	 * false".
+	 */
+	if (use_gui_tool == 1)
 		setenv("GIT_MERGETOOL_GUI", "true", 1);
-	else if (difftool_cmd) {
+	else if (use_gui_tool == 0)
+		setenv("GIT_MERGETOOL_GUI", "false", 1);
+
+	if (difftool_cmd) {
 		if (*difftool_cmd)
 			setenv("GIT_DIFF_TOOL", difftool_cmd, 1);
 		else

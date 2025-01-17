@@ -87,7 +87,7 @@ test_expect_success 'result contains a conflict' '
 '
 
 test_expect_success 'virtual trees were processed' '
-	# TODO: fragile test, relies on ambigious merge-base resolution
+	# TODO: fragile test, relies on ambiguous merge-base resolution
 	git ls-files --stage >out &&
 
 	cat >expect <<-EOF &&
@@ -108,8 +108,13 @@ test_expect_success 'refuse to merge binary files' '
 	printf "\0\0" >binary-file &&
 	git add binary-file &&
 	git commit -m binary2 &&
-	test_must_fail git merge F >merge.out 2>merge.err &&
-	grep "Cannot merge binary files: binary-file (HEAD vs. F)" merge.err
+	if test "$GIT_TEST_MERGE_ALGORITHM" = ort
+	then
+		test_must_fail git merge F >merge_output
+	else
+		test_must_fail git merge F 2>merge_output
+	fi &&
+	grep "Cannot merge binary files: binary-file (HEAD vs. F)" merge_output
 '
 
 test_expect_success 'mark rename/delete as unmerged' '

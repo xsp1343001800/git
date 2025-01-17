@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='fetching via git:// using core.gitproxy'
+
 . ./test-lib.sh
 
 test_expect_success 'setup remote repo' '

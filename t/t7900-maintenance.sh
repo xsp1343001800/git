@@ -32,12 +32,14 @@ test_systemd_analyze_verify () {
 }
 
 test_expect_success 'help text' '
-	test_expect_code 129 git maintenance -h 2>err &&
-	test_i18ngrep "usage: git maintenance <subcommand>" err &&
-	test_expect_code 128 git maintenance barf 2>err &&
-	test_i18ngrep "invalid subcommand: barf" err &&
+	test_expect_code 129 git maintenance -h >actual &&
+	test_grep "usage: git maintenance <subcommand>" actual &&
+	test_expect_code 129 git maintenance barf 2>err &&
+	test_grep "unknown subcommand: \`barf'\''" err &&
+	test_grep "usage: git maintenance" err &&
 	test_expect_code 129 git maintenance 2>err &&
-	test_i18ngrep "usage: git maintenance" err
+	test_grep "error: need a subcommand" err &&
+	test_grep "usage: git maintenance" err
 '
 
 test_expect_success 'run [--auto|--quiet]' '
@@ -47,22 +49,92 @@ test_expect_success 'run [--auto|--quiet]' '
 		git maintenance run --auto 2>/dev/null &&
 	GIT_TRACE2_EVENT="$(pwd)/run-no-quiet.txt" \
 		git maintenance run --no-quiet 2>/dev/null &&
-	test_subcommand git gc --quiet <run-no-auto.txt &&
-	test_subcommand ! git gc --auto --quiet <run-auto.txt &&
-	test_subcommand git gc --no-quiet <run-no-quiet.txt
+	test_subcommand git gc --quiet --no-detach <run-no-auto.txt &&
+	test_subcommand ! git gc --auto --quiet --no-detach <run-auto.txt &&
+	test_subcommand git gc --no-quiet --no-detach <run-no-quiet.txt
 '
 
 test_expect_success 'maintenance.auto config option' '
 	GIT_TRACE2_EVENT="$(pwd)/default" git commit --quiet --allow-empty -m 1 &&
-	test_subcommand git maintenance run --auto --quiet <default &&
+	test_subcommand git maintenance run --auto --quiet --detach <default &&
 	GIT_TRACE2_EVENT="$(pwd)/true" \
 		git -c maintenance.auto=true \
 		commit --quiet --allow-empty -m 2 &&
-	test_subcommand git maintenance run --auto --quiet  <true &&
+	test_subcommand git maintenance run --auto --quiet --detach <true &&
 	GIT_TRACE2_EVENT="$(pwd)/false" \
 		git -c maintenance.auto=false \
 		commit --quiet --allow-empty -m 3 &&
-	test_subcommand ! git maintenance run --auto --quiet  <false
+	test_subcommand ! git maintenance run --auto --quiet --detach <false
+'
+
+for cfg in maintenance.autoDetach gc.autoDetach
+do
+	test_expect_success "$cfg=true config option" '
+		test_when_finished "rm -f trace" &&
+		test_config $cfg true &&
+		GIT_TRACE2_EVENT="$(pwd)/trace" git commit --quiet --allow-empty -m 1 &&
+		test_subcommand git maintenance run --auto --quiet --detach <trace
+	'
+
+	test_expect_success "$cfg=false config option" '
+		test_when_finished "rm -f trace" &&
+		test_config $cfg false &&
+		GIT_TRACE2_EVENT="$(pwd)/trace" git commit --quiet --allow-empty -m 1 &&
+		test_subcommand git maintenance run --auto --quiet --no-detach <trace
+	'
+done
+
+test_expect_success "maintenance.autoDetach overrides gc.autoDetach" '
+	test_when_finished "rm -f trace" &&
+	test_config maintenance.autoDetach false &&
+	test_config gc.autoDetach true &&
+	GIT_TRACE2_EVENT="$(pwd)/trace" git commit --quiet --allow-empty -m 1 &&
+	test_subcommand git maintenance run --auto --quiet --no-detach <trace
+'
+
+test_expect_success 'register uses XDG_CONFIG_HOME config if it exists' '
+	test_when_finished rm -r .config/git/config &&
+	(
+		XDG_CONFIG_HOME=.config &&
+		export XDG_CONFIG_HOME &&
+		mkdir -p $XDG_CONFIG_HOME/git &&
+		>$XDG_CONFIG_HOME/git/config &&
+		git maintenance register &&
+		git config --file=$XDG_CONFIG_HOME/git/config --get maintenance.repo >actual &&
+		pwd >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'register does not need XDG_CONFIG_HOME config to exist' '
+	test_when_finished git maintenance unregister &&
+	test_path_is_missing $XDG_CONFIG_HOME/git/config &&
+	git maintenance register &&
+	git config --global --get maintenance.repo >actual &&
+	pwd >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success 'unregister uses XDG_CONFIG_HOME config if it exists' '
+	test_when_finished rm -r .config/git/config &&
+	(
+		XDG_CONFIG_HOME=.config &&
+		export XDG_CONFIG_HOME &&
+		mkdir -p $XDG_CONFIG_HOME/git &&
+		>$XDG_CONFIG_HOME/git/config &&
+		git maintenance register &&
+		git maintenance unregister &&
+		test_must_fail git config --file=$XDG_CONFIG_HOME/git/config --get maintenance.repo >actual &&
+		test_must_be_empty actual
+	)
+'
+
+test_expect_success 'unregister does not need XDG_CONFIG_HOME config to exist' '
+	test_path_is_missing $XDG_CONFIG_HOME/git/config &&
+	git maintenance register &&
+	git maintenance unregister &&
+	test_must_fail git config --global --get maintenance.repo >actual &&
+	test_must_be_empty actual
 '
 
 test_expect_success 'maintenance.<task>.enabled' '
@@ -82,9 +154,9 @@ test_expect_success 'run --task=<task>' '
 		git maintenance run --task=commit-graph 2>/dev/null &&
 	GIT_TRACE2_EVENT="$(pwd)/run-both.txt" \
 		git maintenance run --task=commit-graph --task=gc 2>/dev/null &&
-	test_subcommand ! git gc --quiet <run-commit-graph.txt &&
-	test_subcommand git gc --quiet <run-gc.txt &&
-	test_subcommand git gc --quiet <run-both.txt &&
+	test_subcommand ! git gc --quiet --no-detach <run-commit-graph.txt &&
+	test_subcommand git gc --quiet --no-detach <run-gc.txt &&
+	test_subcommand git gc --quiet --no-detach <run-both.txt &&
 	test_subcommand git commit-graph write --split --reachable --no-progress <run-commit-graph.txt &&
 	test_subcommand ! git commit-graph write --split --reachable --no-progress <run-gc.txt &&
 	test_subcommand git commit-graph write --split --reachable --no-progress <run-both.txt
@@ -129,12 +201,12 @@ test_expect_success 'commit-graph auto condition' '
 
 test_expect_success 'run --task=bogus' '
 	test_must_fail git maintenance run --task=bogus 2>err &&
-	test_i18ngrep "is not a valid task" err
+	test_grep "is not a valid task" err
 '
 
 test_expect_success 'run --task duplicate' '
 	test_must_fail git maintenance run --task=gc --task=gc 2>err &&
-	test_i18ngrep "cannot be selected multiple times" err
+	test_grep "cannot be selected multiple times" err
 '
 
 test_expect_success 'run --task=prefetch with no remotes' '
@@ -155,14 +227,14 @@ test_expect_success 'prefetch multiple remotes' '
 	fetchargs="--prefetch --prune --no-tags --no-write-fetch-head --recurse-submodules=no --quiet" &&
 	test_subcommand git fetch remote1 $fetchargs <run-prefetch.txt &&
 	test_subcommand git fetch remote2 $fetchargs <run-prefetch.txt &&
-	test_path_is_missing .git/refs/remotes &&
+	git for-each-ref refs/remotes >actual &&
+	test_must_be_empty actual &&
 	git log prefetch/remotes/remote1/one &&
 	git log prefetch/remotes/remote2/two &&
 	git fetch --all &&
 	test_cmp_rev refs/remotes/remote1/one refs/prefetch/remotes/remote1/one &&
 	test_cmp_rev refs/remotes/remote2/two refs/prefetch/remotes/remote2/two &&
 
-	test_cmp_config refs/prefetch/ log.excludedecoration &&
 	git log --oneline --decorate --all >log &&
 	! grep "prefetch" log &&
 
@@ -171,26 +243,6 @@ test_expect_success 'prefetch multiple remotes' '
 	GIT_TRACE2_EVENT="$(pwd)/skip-remote1.txt" git maintenance run --task=prefetch 2>/dev/null &&
 	test_subcommand ! git fetch remote1 $fetchargs <skip-remote1.txt &&
 	test_subcommand git fetch remote2 $fetchargs <skip-remote1.txt
-'
-
-test_expect_success 'prefetch and existing log.excludeDecoration values' '
-	git config --unset-all log.excludeDecoration &&
-	git config log.excludeDecoration refs/remotes/remote1/ &&
-	git maintenance run --task=prefetch &&
-
-	git config --get-all log.excludeDecoration >out &&
-	grep refs/remotes/remote1/ out &&
-	grep refs/prefetch/ out &&
-
-	git log --oneline --decorate --all >log &&
-	! grep "prefetch" log &&
-	! grep "remote1" log &&
-	grep "remote2" log &&
-
-	# a second run does not change the config
-	git maintenance run --task=prefetch &&
-	git log --oneline --decorate --all >log2 &&
-	test_cmp log log2
 '
 
 test_expect_success 'loose-objects task' '
@@ -276,7 +328,8 @@ test_expect_success 'incremental-repack task' '
 
 	# Delete refs that have not been repacked in these packs.
 	git for-each-ref --format="delete %(refname)" \
-		refs/prefetch refs/tags refs/remotes >refs &&
+		refs/prefetch refs/tags refs/remotes \
+		--exclude=refs/remotes/*/HEAD >refs &&
 	git update-ref --stdin <refs &&
 
 	# Replace the object directory with this pack layout.
@@ -396,12 +449,12 @@ test_expect_success 'pack-refs task' '
 
 test_expect_success '--auto and --schedule incompatible' '
 	test_must_fail git maintenance run --auto --schedule=daily 2>err &&
-	test_i18ngrep "at most one" err
+	test_grep "at most one" err
 '
 
 test_expect_success 'invalid --schedule value' '
 	test_must_fail git maintenance run --schedule=annually 2>err &&
-	test_i18ngrep "unrecognized --schedule" err
+	test_grep "unrecognized --schedule" err
 '
 
 test_expect_success '--schedule inheritance weekly -> daily -> hourly' '
@@ -499,6 +552,11 @@ test_expect_success 'maintenance.strategy inheritance' '
 
 test_expect_success 'register and unregister' '
 	test_when_finished git config --global --unset-all maintenance.repo &&
+
+	test_must_fail git maintenance unregister 2>err &&
+	grep "is not registered" err &&
+	git maintenance unregister --force &&
+
 	git config --global --add maintenance.repo /existing1 &&
 	git config --global --add maintenance.repo /existing2 &&
 	git config --global --get-all maintenance.repo >before &&
@@ -512,7 +570,68 @@ test_expect_success 'register and unregister' '
 
 	git maintenance unregister &&
 	git config --global --get-all maintenance.repo >actual &&
-	test_cmp before actual
+	test_cmp before actual &&
+
+	git config --file ./other --add maintenance.repo /existing1 &&
+	git config --file ./other --add maintenance.repo /existing2 &&
+	git config --file ./other --get-all maintenance.repo >before &&
+
+	git maintenance register --config-file ./other &&
+	test_cmp_config false maintenance.auto &&
+	git config --file ./other --get-all maintenance.repo >between &&
+	cp before expect &&
+	pwd >>expect &&
+	test_cmp expect between &&
+
+	git maintenance unregister --config-file ./other &&
+	git config --file ./other --get-all maintenance.repo >actual &&
+	test_cmp before actual &&
+
+	test_must_fail git maintenance unregister 2>err &&
+	grep "is not registered" err &&
+	git maintenance unregister --force &&
+
+	test_must_fail git maintenance unregister --config-file ./other 2>err &&
+	grep "is not registered" err &&
+	git maintenance unregister --config-file ./other --force
+'
+
+test_expect_success 'register with no value for maintenance.repo' '
+	cp .git/config .git/config.orig &&
+	test_when_finished mv .git/config.orig .git/config &&
+
+	cat >>.git/config <<-\EOF &&
+	[maintenance]
+		repo
+	EOF
+	cat >expect <<-\EOF &&
+	error: missing value for '\''maintenance.repo'\''
+	EOF
+	git maintenance register 2>actual &&
+	test_cmp expect actual &&
+	git config maintenance.repo
+'
+
+test_expect_success 'unregister with no value for maintenance.repo' '
+	cp .git/config .git/config.orig &&
+	test_when_finished mv .git/config.orig .git/config &&
+
+	cat >>.git/config <<-\EOF &&
+	[maintenance]
+		repo
+	EOF
+	cat >expect <<-\EOF &&
+	error: missing value for '\''maintenance.repo'\''
+	EOF
+	test_expect_code 128 git maintenance unregister 2>actual.raw &&
+	grep ^error actual.raw >actual &&
+	test_cmp expect actual &&
+	git config maintenance.repo &&
+
+	git maintenance unregister --force 2>actual.raw &&
+	grep ^error actual.raw >actual &&
+	test_cmp expect actual &&
+	git config maintenance.repo
 '
 
 test_expect_success !MINGW 'register and unregister with regex metacharacters' '
@@ -527,17 +646,33 @@ test_expect_success !MINGW 'register and unregister with regex metacharacters' '
 		maintenance.repo "$(pwd)/$META"
 '
 
+test_expect_success 'start without GIT_TEST_MAINT_SCHEDULER' '
+	test_when_finished "rm -rf systemctl.log script repo" &&
+	mkdir script &&
+	write_script script/systemctl <<-\EOF &&
+	echo "$*" >>../systemctl.log
+	EOF
+	git init repo &&
+	(
+		cd repo &&
+		sane_unset GIT_TEST_MAINT_SCHEDULER &&
+		PATH="$PWD/../script:$PATH" git maintenance start --scheduler=systemd
+	) &&
+	test_grep -- "--user list-timers" systemctl.log &&
+	test_grep -- "enable --now git-maintenance@" systemctl.log
+'
+
 test_expect_success 'start --scheduler=<scheduler>' '
 	test_expect_code 129 git maintenance start --scheduler=foo 2>err &&
-	test_i18ngrep "unrecognized --scheduler argument" err &&
+	test_grep "unrecognized --scheduler argument" err &&
 
 	test_expect_code 129 git maintenance start --no-scheduler 2>err &&
-	test_i18ngrep "unknown option" err &&
+	test_grep "unknown option" err &&
 
 	test_expect_code 128 \
 		env GIT_TEST_MAINT_SCHEDULER="launchctl:true,schtasks:true" \
 		git maintenance start --scheduler=crontab 2>err &&
-	test_i18ngrep "fatal: crontab scheduler is not available" err
+	test_grep "fatal: crontab scheduler is not available" err
 '
 
 test_expect_success 'start from empty cron table' '
@@ -546,9 +681,9 @@ test_expect_success 'start from empty cron table' '
 	# start registers the repo
 	git config --get --global --fixed-value maintenance.repo "$(pwd)" &&
 
-	grep "for-each-repo --config=maintenance.repo maintenance run --schedule=daily" cron.txt &&
-	grep "for-each-repo --config=maintenance.repo maintenance run --schedule=hourly" cron.txt &&
-	grep "for-each-repo --config=maintenance.repo maintenance run --schedule=weekly" cron.txt
+	grep "for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=daily" cron.txt &&
+	grep "for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=hourly" cron.txt &&
+	grep "for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=weekly" cron.txt
 '
 
 test_expect_success 'stop from existing schedule' '
@@ -697,7 +832,18 @@ test_expect_success 'start and stop Linux/systemd maintenance' '
 	# start registers the repo
 	git config --get --global --fixed-value maintenance.repo "$(pwd)" &&
 
-	test_systemd_analyze_verify "systemd/user/git-maintenance@.service" &&
+	for schedule in hourly daily weekly
+	do
+		test_path_is_file "systemd/user/git-maintenance@$schedule.timer" || return 1
+	done &&
+	test_path_is_file "systemd/user/git-maintenance@.service" &&
+
+	test_systemd_analyze_verify "systemd/user/git-maintenance@hourly.service" &&
+	test_systemd_analyze_verify "systemd/user/git-maintenance@daily.service" &&
+	test_systemd_analyze_verify "systemd/user/git-maintenance@weekly.service" &&
+
+	grep "core.askPass=true" "systemd/user/git-maintenance@.service" &&
+	grep "credential.interactive=false" "systemd/user/git-maintenance@.service" &&
 
 	printf -- "--user enable --now git-maintenance@%s.timer\n" hourly daily weekly >expect &&
 	test_cmp expect args &&
@@ -708,7 +854,10 @@ test_expect_success 'start and stop Linux/systemd maintenance' '
 	# stop does not unregister the repo
 	git config --get --global --fixed-value maintenance.repo "$(pwd)" &&
 
-	test_path_is_missing "systemd/user/git-maintenance@.timer" &&
+	for schedule in hourly daily weekly
+	do
+		test_path_is_missing "systemd/user/git-maintenance@$schedule.timer" || return 1
+	done &&
 	test_path_is_missing "systemd/user/git-maintenance@.service" &&
 
 	printf -- "--user disable --now git-maintenance@%s.timer\n" hourly daily weekly >expect &&
@@ -789,6 +938,90 @@ test_expect_success 'register and unregister bare repo' '
 		git maintenance unregister &&
 		test_must_fail git config --global --get-all maintenance.repo
 	)
+'
+
+test_expect_success 'failed schedule prevents config change' '
+	git init --bare failcase &&
+
+	for scheduler in crontab launchctl schtasks systemctl
+	do
+		GIT_TEST_MAINT_SCHEDULER="$scheduler:false" &&
+		export GIT_TEST_MAINT_SCHEDULER &&
+		test_must_fail \
+			git -C failcase maintenance start &&
+		test_must_fail git -C failcase config maintenance.auto || return 1
+	done
+'
+
+test_expect_success '--no-detach causes maintenance to not run in background' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		# Prepare the repository such that git-maintenance(1) ends up
+		# outputting something.
+		test_commit something &&
+		git config set maintenance.gc.enabled false &&
+		git config set maintenance.loose-objects.enabled true &&
+		git config set maintenance.loose-objects.auto 1 &&
+		git config set maintenance.incremental-repack.enabled true &&
+
+		GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			git maintenance run --no-detach >out 2>&1 &&
+		! test_region maintenance detach trace.txt
+	)
+'
+
+test_expect_success '--detach causes maintenance to run in background' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		test_commit something &&
+		git config set maintenance.gc.enabled false &&
+		git config set maintenance.loose-objects.enabled true &&
+		git config set maintenance.loose-objects.auto 1 &&
+		git config set maintenance.incremental-repack.enabled true &&
+
+		# The extra file descriptor gets inherited to the child
+		# process, and by reading stdout we thus essentially wait for
+		# that descriptor to get closed, which indicates that the child
+		# is done, too.
+		does_not_matter=$(GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			git maintenance run --detach 9>&1) &&
+		test_region maintenance detach trace.txt
+	)
+'
+
+test_expect_success 'repacking loose objects is quiet' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		test_commit something &&
+		git config set maintenance.gc.enabled false &&
+		git config set maintenance.loose-objects.enabled true &&
+		git config set maintenance.loose-objects.auto 1 &&
+
+		git maintenance run --quiet >out 2>&1 &&
+		test_must_be_empty out
+	)
+'
+
+test_expect_success 'maintenance aborts with existing lock file' '
+	test_when_finished "rm -rf repo script" &&
+	mkdir script &&
+	write_script script/systemctl <<-\EOF &&
+	true
+	EOF
+
+	git init repo &&
+	: >repo/.git/objects/schedule.lock &&
+	test_must_fail env PATH="$PWD/script:$PATH" git -C repo maintenance start --scheduler=systemd 2>err &&
+	test_grep "Another scheduled git-maintenance(1) process seems to be running" err
 '
 
 test_done

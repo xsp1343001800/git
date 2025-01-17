@@ -5,6 +5,7 @@
 
 test_description='Same rename detection as t4003 but testing diff-raw.'
 
+
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-diff.sh ;# test-lib chdir's into trash
 

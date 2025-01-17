@@ -1,11 +1,23 @@
-#include "../cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "../git-compat-util.h"
 #include "../config.h"
+#include "../dir.h"
+#include "../gettext.h"
+#include "../hash.h"
+#include "../hex.h"
 #include "../refs.h"
 #include "refs-internal.h"
 #include "packed-backend.h"
 #include "../iterator.h"
 #include "../lockfile.h"
 #include "../chdir-notify.h"
+#include "../statinfo.h"
+#include "../worktree.h"
+#include "../wrapper.h"
+#include "../write-or-die.h"
+#include "../trace2.h"
 
 enum mmap_strategy {
 	/*
@@ -193,21 +205,25 @@ static int release_snapshot(struct snapshot *snapshot)
 	}
 }
 
-struct ref_store *packed_ref_store_create(struct repository *repo,
-					  const char *path,
-					  unsigned int store_flags)
+static size_t snapshot_hexsz(const struct snapshot *snapshot)
+{
+	return snapshot->refs->base.repo->hash_algo->hexsz;
+}
+
+struct ref_store *packed_ref_store_init(struct repository *repo,
+					const char *gitdir,
+					unsigned int store_flags)
 {
 	struct packed_ref_store *refs = xcalloc(1, sizeof(*refs));
 	struct ref_store *ref_store = (struct ref_store *)refs;
+	struct strbuf sb = STRBUF_INIT;
 
-	base_ref_store_init(ref_store, &refs_be_packed);
-	ref_store->repo = repo;
-	ref_store->gitdir = xstrdup(path);
+	base_ref_store_init(ref_store, repo, gitdir, &refs_be_packed);
 	refs->store_flags = store_flags;
 
-	refs->path = xstrdup(path);
+	strbuf_addf(&sb, "%s/packed-refs", gitdir);
+	refs->path = strbuf_detach(&sb, NULL);
 	chdir_notify_reparent("packed-refs", &refs->path);
-
 	return ref_store;
 }
 
@@ -246,6 +262,15 @@ static void clear_snapshot(struct packed_ref_store *refs)
 	}
 }
 
+static void packed_ref_store_release(struct ref_store *ref_store)
+{
+	struct packed_ref_store *refs = packed_downcast(ref_store, 0, "release");
+	clear_snapshot(refs);
+	rollback_lock_file(&refs->lock);
+	delete_tempfile(&refs->tempfile);
+	free(refs->path);
+}
+
 static NORETURN void die_unterminated_line(const char *path,
 					   const char *p, size_t len)
 {
@@ -274,11 +299,13 @@ struct snapshot_record {
 	size_t len;
 };
 
-static int cmp_packed_ref_records(const void *v1, const void *v2)
+static int cmp_packed_ref_records(const void *v1, const void *v2,
+				  void *cb_data)
 {
+	const struct snapshot *snapshot = cb_data;
 	const struct snapshot_record *e1 = v1, *e2 = v2;
-	const char *r1 = e1->start + the_hash_algo->hexsz + 1;
-	const char *r2 = e2->start + the_hash_algo->hexsz + 1;
+	const char *r1 = e1->start + snapshot_hexsz(snapshot) + 1;
+	const char *r2 = e2->start + snapshot_hexsz(snapshot) + 1;
 
 	while (1) {
 		if (*r1 == '\n')
@@ -298,16 +325,17 @@ static int cmp_packed_ref_records(const void *v1, const void *v2)
  * Compare a snapshot record at `rec` to the specified NUL-terminated
  * refname.
  */
-static int cmp_record_to_refname(const char *rec, const char *refname)
+static int cmp_record_to_refname(const char *rec, const char *refname,
+				 int start, const struct snapshot *snapshot)
 {
-	const char *r1 = rec + the_hash_algo->hexsz + 1;
+	const char *r1 = rec + snapshot_hexsz(snapshot) + 1;
 	const char *r2 = refname;
 
 	while (1) {
 		if (*r1 == '\n')
 			return *r2 ? -1 : 0;
 		if (!*r2)
-			return 1;
+			return start ? 1 : -1;
 		if (*r1 != *r2)
 			return (unsigned char)*r1 < (unsigned char)*r2 ? -1 : +1;
 		r1++;
@@ -347,7 +375,7 @@ static void sort_snapshot(struct snapshot *snapshot)
 		if (!eol)
 			/* The safety check should prevent this. */
 			BUG("unterminated line found in packed-refs");
-		if (eol - pos < the_hash_algo->hexsz + 2)
+		if (eol - pos < snapshot_hexsz(snapshot) + 2)
 			die_invalid_line(snapshot->refs->path,
 					 pos, eof - pos);
 		eol++;
@@ -373,7 +401,7 @@ static void sort_snapshot(struct snapshot *snapshot)
 		if (sorted &&
 		    nr > 1 &&
 		    cmp_packed_ref_records(&records[nr - 2],
-					   &records[nr - 1]) >= 0)
+					   &records[nr - 1], snapshot) >= 0)
 			sorted = 0;
 
 		pos = eol;
@@ -383,7 +411,7 @@ static void sort_snapshot(struct snapshot *snapshot)
 		goto cleanup;
 
 	/* We need to sort the memory. First we sort the records array: */
-	QSORT(records, nr, cmp_packed_ref_records);
+	QSORT_S(records, nr, cmp_packed_ref_records, snapshot);
 
 	/*
 	 * Allocate a new chunk of memory, and copy the old memory to
@@ -459,7 +487,8 @@ static void verify_buffer_safe(struct snapshot *snapshot)
 		return;
 
 	last_line = find_start_of_record(start, eof - 1);
-	if (*(eof - 1) != '\n' || eof - last_line < the_hash_algo->hexsz + 2)
+	if (*(eof - 1) != '\n' ||
+	    eof - last_line < snapshot_hexsz(snapshot) + 2)
 		die_invalid_line(snapshot->refs->path,
 				 last_line, eof - last_line);
 }
@@ -522,22 +551,9 @@ static int load_contents(struct snapshot *snapshot)
 	return 1;
 }
 
-/*
- * Find the place in `snapshot->buf` where the start of the record for
- * `refname` starts. If `mustexist` is true and the reference doesn't
- * exist, then return NULL. If `mustexist` is false and the reference
- * doesn't exist, then return the point where that reference would be
- * inserted, or `snapshot->eof` (which might be NULL) if it would be
- * inserted at the end of the file. In the latter mode, `refname`
- * doesn't have to be a proper reference name; for example, one could
- * search for "refs/replace/" to find the start of any replace
- * references.
- *
- * The record is sought using a binary search, so `snapshot->buf` must
- * be sorted.
- */
-static const char *find_reference_location(struct snapshot *snapshot,
-					   const char *refname, int mustexist)
+static const char *find_reference_location_1(struct snapshot *snapshot,
+					     const char *refname, int mustexist,
+					     int start)
 {
 	/*
 	 * This is not *quite* a garden-variety binary search, because
@@ -567,7 +583,7 @@ static const char *find_reference_location(struct snapshot *snapshot,
 
 		mid = lo + (hi - lo) / 2;
 		rec = find_start_of_record(lo, mid);
-		cmp = cmp_record_to_refname(rec, refname);
+		cmp = cmp_record_to_refname(rec, refname, start, snapshot);
 		if (cmp < 0) {
 			lo = find_end_of_record(mid, hi);
 		} else if (cmp > 0) {
@@ -581,6 +597,41 @@ static const char *find_reference_location(struct snapshot *snapshot,
 		return NULL;
 	else
 		return lo;
+}
+
+/*
+ * Find the place in `snapshot->buf` where the start of the record for
+ * `refname` starts. If `mustexist` is true and the reference doesn't
+ * exist, then return NULL. If `mustexist` is false and the reference
+ * doesn't exist, then return the point where that reference would be
+ * inserted, or `snapshot->eof` (which might be NULL) if it would be
+ * inserted at the end of the file. In the latter mode, `refname`
+ * doesn't have to be a proper reference name; for example, one could
+ * search for "refs/replace/" to find the start of any replace
+ * references.
+ *
+ * The record is sought using a binary search, so `snapshot->buf` must
+ * be sorted.
+ */
+static const char *find_reference_location(struct snapshot *snapshot,
+					   const char *refname, int mustexist)
+{
+	return find_reference_location_1(snapshot, refname, mustexist, 1);
+}
+
+/*
+ * Find the place in `snapshot->buf` after the end of the record for
+ * `refname`. In other words, find the location of first thing *after*
+ * `refname`.
+ *
+ * Other semantics are identical to the ones in
+ * `find_reference_location()`.
+ */
+static const char *find_reference_location_end(struct snapshot *snapshot,
+					       const char *refname,
+					       int mustexist)
+{
+	return find_reference_location_1(snapshot, refname, mustexist, 0);
 }
 
 /*
@@ -647,7 +698,7 @@ static struct snapshot *create_snapshot(struct packed_ref_store *refs)
 					 snapshot->buf,
 					 snapshot->eof - snapshot->buf);
 
-		string_list_split_in_place(&traits, p, ' ', -1);
+		string_list_split_in_place(&traits, p, " ", -1);
 
 		if (unsorted_string_list_has_string(&traits, "fully-peeled"))
 			snapshot->peeled = PEELED_FULLY;
@@ -727,7 +778,7 @@ static struct snapshot *get_snapshot(struct packed_ref_store *refs)
 }
 
 static int packed_read_raw_ref(struct ref_store *ref_store, const char *refname,
-			       struct object_id *oid, struct strbuf *referent,
+			       struct object_id *oid, struct strbuf *referent UNUSED,
 			       unsigned int *type, int *failure_errno)
 {
 	struct packed_ref_store *refs =
@@ -745,7 +796,7 @@ static int packed_read_raw_ref(struct ref_store *ref_store, const char *refname,
 		return -1;
 	}
 
-	if (get_oid_hex(rec, oid))
+	if (get_oid_hex_algop(rec, oid, ref_store->repo->hash_algo))
 		die_invalid_line(refs->path, rec, snapshot->eof - rec);
 
 	*type = REF_ISPACKED;
@@ -774,6 +825,13 @@ struct packed_ref_iterator {
 	/* The end of the part of the buffer that will be iterated over: */
 	const char *eof;
 
+	struct jump_list_entry {
+		const char *start;
+		const char *end;
+	} *jump;
+	size_t jump_nr, jump_alloc;
+	size_t jump_cur;
+
 	/* Scratch space for current values: */
 	struct object_id oid, peeled;
 	struct strbuf refname_buf;
@@ -791,17 +849,39 @@ struct packed_ref_iterator {
  */
 static int next_record(struct packed_ref_iterator *iter)
 {
-	const char *p = iter->pos, *eol;
+	const char *p, *eol;
 
 	strbuf_reset(&iter->refname_buf);
+
+	/*
+	 * If iter->pos is contained within a skipped region, jump past
+	 * it.
+	 *
+	 * Note that each skipped region is considered at most once,
+	 * since they are ordered based on their starting position.
+	 */
+	while (iter->jump_cur < iter->jump_nr) {
+		struct jump_list_entry *curr = &iter->jump[iter->jump_cur];
+		if (iter->pos < curr->start)
+			break; /* not to the next jump yet */
+
+		iter->jump_cur++;
+		if (iter->pos < curr->end) {
+			iter->pos = curr->end;
+			trace2_counter_add(TRACE2_COUNTER_ID_PACKED_REFS_JUMPS, 1);
+			/* jumps are coalesced, so only one jump is necessary */
+			break;
+		}
+	}
 
 	if (iter->pos == iter->eof)
 		return ITER_DONE;
 
 	iter->base.flags = REF_ISPACKED;
+	p = iter->pos;
 
-	if (iter->eof - p < the_hash_algo->hexsz + 2 ||
-	    parse_oid_hex(p, &iter->oid, &p) ||
+	if (iter->eof - p < snapshot_hexsz(iter->snapshot) + 2 ||
+	    parse_oid_hex_algop(p, &iter->oid, &p, iter->repo->hash_algo) ||
 	    !isspace(*p++))
 		die_invalid_line(iter->snapshot->refs->path,
 				 iter->pos, iter->eof - iter->pos);
@@ -818,7 +898,7 @@ static int next_record(struct packed_ref_iterator *iter)
 		if (!refname_is_safe(iter->base.refname))
 			die("packed refname is dangerous: %s",
 			    iter->base.refname);
-		oidclr(&iter->oid);
+		oidclr(&iter->oid, iter->repo->hash_algo);
 		iter->base.flags |= REF_BAD_NAME | REF_ISBROKEN;
 	}
 	if (iter->snapshot->peeled == PEELED_FULLY ||
@@ -830,8 +910,8 @@ static int next_record(struct packed_ref_iterator *iter)
 
 	if (iter->pos < iter->eof && *iter->pos == '^') {
 		p = iter->pos + 1;
-		if (iter->eof - p < the_hash_algo->hexsz + 1 ||
-		    parse_oid_hex(p, &iter->peeled, &p) ||
+		if (iter->eof - p < snapshot_hexsz(iter->snapshot) + 1 ||
+		    parse_oid_hex_algop(p, &iter->peeled, &p, iter->repo->hash_algo) ||
 		    *p++ != '\n')
 			die_invalid_line(iter->snapshot->refs->path,
 					 iter->pos, iter->eof - iter->pos);
@@ -843,13 +923,13 @@ static int next_record(struct packed_ref_iterator *iter)
 		 * we suppress it if the reference is broken:
 		 */
 		if ((iter->base.flags & REF_ISBROKEN)) {
-			oidclr(&iter->peeled);
+			oidclr(&iter->peeled, iter->repo->hash_algo);
 			iter->base.flags &= ~REF_KNOWS_PEELED;
 		} else {
 			iter->base.flags |= REF_KNOWS_PEELED;
 		}
 	} else {
-		oidclr(&iter->peeled);
+		oidclr(&iter->peeled, iter->repo->hash_algo);
 	}
 
 	return ITER_OK;
@@ -863,7 +943,7 @@ static int packed_ref_iterator_advance(struct ref_iterator *ref_iterator)
 
 	while ((ok = next_record(iter)) == ITER_OK) {
 		if (iter->flags & DO_FOR_EACH_PER_WORKTREE_ONLY &&
-		    ref_type(iter->base.refname) != REF_TYPE_PER_WORKTREE)
+		    !is_per_worktree_ref(iter->base.refname))
 			continue;
 
 		if (!(iter->flags & DO_FOR_EACH_INCLUDE_BROKEN) &&
@@ -886,16 +966,13 @@ static int packed_ref_iterator_peel(struct ref_iterator *ref_iterator,
 	struct packed_ref_iterator *iter =
 		(struct packed_ref_iterator *)ref_iterator;
 
-	if (iter->repo != the_repository)
-		BUG("peeling for non-the_repository is not supported");
-
 	if ((iter->base.flags & REF_KNOWS_PEELED)) {
 		oidcpy(peeled, &iter->peeled);
 		return is_null_oid(&iter->peeled) ? -1 : 0;
 	} else if ((iter->base.flags & (REF_ISBROKEN | REF_ISSYMREF))) {
 		return -1;
 	} else {
-		return peel_object(&iter->oid, peeled) ? -1 : 0;
+		return peel_object(iter->repo, &iter->oid, peeled) ? -1 : 0;
 	}
 }
 
@@ -906,20 +983,124 @@ static int packed_ref_iterator_abort(struct ref_iterator *ref_iterator)
 	int ok = ITER_DONE;
 
 	strbuf_release(&iter->refname_buf);
+	free(iter->jump);
 	release_snapshot(iter->snapshot);
 	base_ref_iterator_free(ref_iterator);
 	return ok;
 }
 
 static struct ref_iterator_vtable packed_ref_iterator_vtable = {
-	packed_ref_iterator_advance,
-	packed_ref_iterator_peel,
-	packed_ref_iterator_abort
+	.advance = packed_ref_iterator_advance,
+	.peel = packed_ref_iterator_peel,
+	.abort = packed_ref_iterator_abort
 };
+
+static int jump_list_entry_cmp(const void *va, const void *vb)
+{
+	const struct jump_list_entry *a = va;
+	const struct jump_list_entry *b = vb;
+
+	if (a->start < b->start)
+		return -1;
+	if (a->start > b->start)
+		return 1;
+	return 0;
+}
+
+static int has_glob_special(const char *str)
+{
+	const char *p;
+	for (p = str; *p; p++) {
+		if (is_glob_special(*p))
+			return 1;
+	}
+	return 0;
+}
+
+static void populate_excluded_jump_list(struct packed_ref_iterator *iter,
+					struct snapshot *snapshot,
+					const char **excluded_patterns)
+{
+	size_t i, j;
+	const char **pattern;
+	struct jump_list_entry *last_disjoint;
+
+	if (!excluded_patterns)
+		return;
+
+	for (pattern = excluded_patterns; *pattern; pattern++) {
+		struct jump_list_entry *e;
+		const char *start, *end;
+
+		/*
+		 * We can't feed any excludes with globs in them to the
+		 * refs machinery.  It only understands prefix matching.
+		 * We likewise can't even feed the string leading up to
+		 * the first meta-character, as something like "foo[a]"
+		 * should not exclude "foobar" (but the prefix "foo"
+		 * would match that and mark it for exclusion).
+		 */
+		if (has_glob_special(*pattern))
+			continue;
+
+		start = find_reference_location(snapshot, *pattern, 0);
+		end = find_reference_location_end(snapshot, *pattern, 0);
+
+		if (start == end)
+			continue; /* nothing to jump over */
+
+		ALLOC_GROW(iter->jump, iter->jump_nr + 1, iter->jump_alloc);
+
+		e = &iter->jump[iter->jump_nr++];
+		e->start = start;
+		e->end = end;
+	}
+
+	if (!iter->jump_nr) {
+		/*
+		 * Every entry in exclude_patterns has a meta-character,
+		 * nothing to do here.
+		 */
+		return;
+	}
+
+	QSORT(iter->jump, iter->jump_nr, jump_list_entry_cmp);
+
+	/*
+	 * As an optimization, merge adjacent entries in the jump list
+	 * to jump forwards as far as possible when entering a skipped
+	 * region.
+	 *
+	 * For example, if we have two skipped regions:
+	 *
+	 *	[[A, B], [B, C]]
+	 *
+	 * we want to combine that into a single entry jumping from A to
+	 * C.
+	 */
+	last_disjoint = iter->jump;
+
+	for (i = 1, j = 1; i < iter->jump_nr; i++) {
+		struct jump_list_entry *ours = &iter->jump[i];
+		if (ours->start <= last_disjoint->end) {
+			/* overlapping regions extend the previous one */
+			last_disjoint->end = last_disjoint->end > ours->end
+				? last_disjoint->end : ours->end;
+		} else {
+			/* otherwise, insert a new region */
+			iter->jump[j++] = *ours;
+			last_disjoint = ours;
+		}
+	}
+
+	iter->jump_nr = j;
+	iter->jump_cur = 0;
+}
 
 static struct ref_iterator *packed_ref_iterator_begin(
 		struct ref_store *ref_store,
-		const char *prefix, unsigned int flags)
+		const char *prefix, const char **exclude_patterns,
+		unsigned int flags)
 {
 	struct packed_ref_store *refs;
 	struct snapshot *snapshot;
@@ -949,7 +1130,10 @@ static struct ref_iterator *packed_ref_iterator_begin(
 
 	CALLOC_ARRAY(iter, 1);
 	ref_iterator = &iter->base;
-	base_ref_iterator_init(ref_iterator, &packed_ref_iterator_vtable, 1);
+	base_ref_iterator_init(ref_iterator, &packed_ref_iterator_vtable);
+
+	if (exclude_patterns)
+		populate_excluded_jump_list(iter, snapshot, exclude_patterns);
 
 	iter->snapshot = snapshot;
 	acquire_snapshot(snapshot);
@@ -1068,6 +1252,24 @@ int packed_refs_is_locked(struct ref_store *ref_store)
 	return is_lock_file_locked(&refs->lock);
 }
 
+int packed_refs_size(struct ref_store *ref_store,
+		     size_t *out)
+{
+	struct packed_ref_store *refs = packed_downcast(ref_store, REF_STORE_READ,
+							"packed_refs_size");
+	struct stat st;
+
+	if (stat(refs->path, &st) < 0) {
+		if (errno != ENOENT)
+			return -1;
+		*out = 0;
+		return 0;
+	}
+
+	*out = st.st_size;
+	return 0;
+}
+
 /*
  * The packed-refs header line that we write out. Perhaps other traits
  * will be added later.
@@ -1079,9 +1281,24 @@ int packed_refs_is_locked(struct ref_store *ref_store)
 static const char PACKED_REFS_HEADER[] =
 	"# pack-refs with: peeled fully-peeled sorted \n";
 
-static int packed_init_db(struct ref_store *ref_store, struct strbuf *err)
+static int packed_ref_store_create_on_disk(struct ref_store *ref_store UNUSED,
+					   int flags UNUSED,
+					   struct strbuf *err UNUSED)
 {
 	/* Nothing to do. */
+	return 0;
+}
+
+static int packed_ref_store_remove_on_disk(struct ref_store *ref_store,
+					   struct strbuf *err)
+{
+	struct packed_ref_store *refs = packed_downcast(ref_store, 0, "remove");
+
+	if (remove_path(refs->path) < 0) {
+		strbuf_addstr(err, "could not delete packed-refs");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -1143,7 +1360,7 @@ static int write_with_updates(struct packed_ref_store *refs,
 	 * list of refs is exhausted, set iter to NULL. When the list
 	 * of updates is exhausted, leave i set to updates->nr.
 	 */
-	iter = packed_ref_iterator_begin(&refs->base, "",
+	iter = packed_ref_iterator_begin(&refs->base, "", NULL,
 					 DO_FOR_EACH_INCLUDE_BROKEN);
 	if ((ok = ref_iterator_advance(iter)) != ITER_OK)
 		iter = NULL;
@@ -1245,7 +1462,8 @@ static int write_with_updates(struct packed_ref_store *refs,
 			i++;
 		} else {
 			struct object_id peeled;
-			int peel_error = peel_object(&update->new_oid,
+			int peel_error = peel_object(refs->base.repo,
+						     &update->new_oid,
 						     &peeled);
 
 			if (write_packed_entry(out, update->refname,
@@ -1263,7 +1481,9 @@ static int write_with_updates(struct packed_ref_store *refs,
 		goto error;
 	}
 
-	if (close_tempfile_gently(refs->tempfile)) {
+	if (fflush(out) ||
+	    fsync_component(FSYNC_COMPONENT_REFERENCE, get_tempfile_fd(refs->tempfile)) ||
+	    close_tempfile_gently(refs->tempfile)) {
 		strbuf_addf(err, "error closing file %s: %s",
 			    get_tempfile_path(refs->tempfile),
 			    strerror(errno));
@@ -1354,6 +1574,7 @@ int is_packed_transaction_needed(struct ref_store *ref_store,
 	ret = 0;
 	for (i = 0; i < transaction->nr; i++) {
 		struct ref_update *update = transaction->updates[i];
+		int failure_errno;
 		unsigned int type;
 		struct object_id oid;
 
@@ -1364,9 +1585,9 @@ int is_packed_transaction_needed(struct ref_store *ref_store,
 			 */
 			continue;
 
-		if (!refs_read_raw_ref(ref_store, update->refname,
-				       &oid, &referent, &type) ||
-		    errno != ENOENT) {
+		if (!refs_read_raw_ref(ref_store, update->refname, &oid,
+				       &referent, &type, &failure_errno) ||
+		    failure_errno != ENOENT) {
 			/*
 			 * We have to actually delete that reference
 			 * -> this transaction is needed.
@@ -1472,7 +1693,7 @@ failure:
 
 static int packed_transaction_abort(struct ref_store *ref_store,
 				    struct ref_transaction *transaction,
-				    struct strbuf *err)
+				    struct strbuf *err UNUSED)
 {
 	struct packed_ref_store *refs = packed_downcast(
 			ref_store,
@@ -1511,63 +1732,8 @@ cleanup:
 	return ret;
 }
 
-static int packed_initial_transaction_commit(struct ref_store *ref_store,
-					    struct ref_transaction *transaction,
-					    struct strbuf *err)
-{
-	return ref_transaction_commit(transaction, err);
-}
-
-static int packed_delete_refs(struct ref_store *ref_store, const char *msg,
-			     struct string_list *refnames, unsigned int flags)
-{
-	struct packed_ref_store *refs =
-		packed_downcast(ref_store, REF_STORE_WRITE, "delete_refs");
-	struct strbuf err = STRBUF_INIT;
-	struct ref_transaction *transaction;
-	struct string_list_item *item;
-	int ret;
-
-	(void)refs; /* We need the check above, but don't use the variable */
-
-	if (!refnames->nr)
-		return 0;
-
-	/*
-	 * Since we don't check the references' old_oids, the
-	 * individual updates can't fail, so we can pack all of the
-	 * updates into a single transaction.
-	 */
-
-	transaction = ref_store_transaction_begin(ref_store, &err);
-	if (!transaction)
-		return -1;
-
-	for_each_string_list_item(item, refnames) {
-		if (ref_transaction_delete(transaction, item->string, NULL,
-					   flags, msg, &err)) {
-			warning(_("could not delete reference %s: %s"),
-				item->string, err.buf);
-			strbuf_reset(&err);
-		}
-	}
-
-	ret = ref_transaction_commit(transaction, &err);
-
-	if (ret) {
-		if (refnames->nr == 1)
-			error(_("could not delete reference %s: %s"),
-			      refnames->items[0].string, err.buf);
-		else
-			error(_("could not delete references: %s"), err.buf);
-	}
-
-	ref_transaction_free(transaction);
-	strbuf_release(&err);
-	return ret;
-}
-
-static int packed_pack_refs(struct ref_store *ref_store, unsigned int flags)
+static int packed_pack_refs(struct ref_store *ref_store UNUSED,
+			    struct pack_refs_opts *pack_opts UNUSED)
 {
 	/*
 	 * Packed refs are already packed. It might be that loose refs
@@ -1577,106 +1743,48 @@ static int packed_pack_refs(struct ref_store *ref_store, unsigned int flags)
 	return 0;
 }
 
-static int packed_create_symref(struct ref_store *ref_store,
-			       const char *refname, const char *target,
-			       const char *logmsg)
-{
-	BUG("packed reference store does not support symrefs");
-}
-
-static int packed_rename_ref(struct ref_store *ref_store,
-			    const char *oldrefname, const char *newrefname,
-			    const char *logmsg)
-{
-	BUG("packed reference store does not support renaming references");
-}
-
-static int packed_copy_ref(struct ref_store *ref_store,
-			   const char *oldrefname, const char *newrefname,
-			   const char *logmsg)
-{
-	BUG("packed reference store does not support copying references");
-}
-
-static struct ref_iterator *packed_reflog_iterator_begin(struct ref_store *ref_store)
+static struct ref_iterator *packed_reflog_iterator_begin(struct ref_store *ref_store UNUSED)
 {
 	return empty_ref_iterator_begin();
 }
 
-static int packed_for_each_reflog_ent(struct ref_store *ref_store,
-				      const char *refname,
-				      each_reflog_ent_fn fn, void *cb_data)
+static int packed_fsck(struct ref_store *ref_store UNUSED,
+		       struct fsck_options *o UNUSED,
+		       struct worktree *wt)
 {
-	BUG("packed reference store does not support reflogs");
-	return 0;
-}
 
-static int packed_for_each_reflog_ent_reverse(struct ref_store *ref_store,
-					      const char *refname,
-					      each_reflog_ent_fn fn,
-					      void *cb_data)
-{
-	BUG("packed reference store does not support reflogs");
-	return 0;
-}
+	if (!is_main_worktree(wt))
+		return 0;
 
-static int packed_reflog_exists(struct ref_store *ref_store,
-			       const char *refname)
-{
-	BUG("packed reference store does not support reflogs");
-	return 0;
-}
-
-static int packed_create_reflog(struct ref_store *ref_store,
-			       const char *refname, int force_create,
-			       struct strbuf *err)
-{
-	BUG("packed reference store does not support reflogs");
-}
-
-static int packed_delete_reflog(struct ref_store *ref_store,
-			       const char *refname)
-{
-	BUG("packed reference store does not support reflogs");
-	return 0;
-}
-
-static int packed_reflog_expire(struct ref_store *ref_store,
-				const char *refname,
-				unsigned int flags,
-				reflog_expiry_prepare_fn prepare_fn,
-				reflog_expiry_should_prune_fn should_prune_fn,
-				reflog_expiry_cleanup_fn cleanup_fn,
-				void *policy_cb_data)
-{
-	BUG("packed reference store does not support reflogs");
 	return 0;
 }
 
 struct ref_storage_be refs_be_packed = {
-	NULL,
-	"packed",
-	packed_ref_store_create,
-	packed_init_db,
-	packed_transaction_prepare,
-	packed_transaction_finish,
-	packed_transaction_abort,
-	packed_initial_transaction_commit,
+	.name = "packed",
+	.init = packed_ref_store_init,
+	.release = packed_ref_store_release,
+	.create_on_disk = packed_ref_store_create_on_disk,
+	.remove_on_disk = packed_ref_store_remove_on_disk,
 
-	packed_pack_refs,
-	packed_create_symref,
-	packed_delete_refs,
-	packed_rename_ref,
-	packed_copy_ref,
+	.transaction_prepare = packed_transaction_prepare,
+	.transaction_finish = packed_transaction_finish,
+	.transaction_abort = packed_transaction_abort,
 
-	packed_ref_iterator_begin,
-	packed_read_raw_ref,
+	.pack_refs = packed_pack_refs,
+	.rename_ref = NULL,
+	.copy_ref = NULL,
 
-	packed_reflog_iterator_begin,
-	packed_for_each_reflog_ent,
-	packed_for_each_reflog_ent_reverse,
-	packed_reflog_exists,
-	packed_create_reflog,
-	packed_delete_reflog,
-	packed_reflog_expire
+	.iterator_begin = packed_ref_iterator_begin,
+	.read_raw_ref = packed_read_raw_ref,
+	.read_symbolic_ref = NULL,
+
+	.reflog_iterator_begin = packed_reflog_iterator_begin,
+	.for_each_reflog_ent = NULL,
+	.for_each_reflog_ent_reverse = NULL,
+	.reflog_exists = NULL,
+	.create_reflog = NULL,
+	.delete_reflog = NULL,
+	.reflog_expire = NULL,
+
+	.fsck = packed_fsck,
 };

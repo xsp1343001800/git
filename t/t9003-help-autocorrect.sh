@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='help.autocorrect finding a match'
+
 . ./test-lib.sh
 
 test_expect_success 'setup' '
@@ -58,6 +59,12 @@ test_expect_success 'autocorrect can be declined altogether' '
 	test_must_fail git lfg 2>actual &&
 	grep "is not a git command" actual &&
 	test_line_count = 1 actual
+'
+
+test_expect_success 'autocorrect works in work tree created from bare repo' '
+	git clone --bare . bare.git &&
+	git -C bare.git worktree add ../worktree &&
+	git -C worktree -c help.autocorrect=immediate status
 '
 
 test_done

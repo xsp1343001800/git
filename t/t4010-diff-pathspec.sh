@@ -9,6 +9,7 @@ Prepare:
         file0
         path1/file1
 '
+
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-diff.sh ;# test-lib chdir's into trash
 
